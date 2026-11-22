@@ -527,7 +527,7 @@ const tetherLineGeo = new THREE.BufferGeometry();
 tetherLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_TETHERS*2*6), 3));
 const tetherLines = new THREE.LineSegments(tetherLineGeo, new THREE.LineBasicMaterial({ color:0xfff6e8, transparent:true, opacity:0.55 }));
 tetherLines.frustumCulled = true; scene.add(tetherLines);
-const TETHER_R = 0.016;   // ~3 cm Dyneema-class rope (≈300 kN working load)
+const TETHER_R = 0.0125;  // 2.5 cm Dyneema/steel rope (≈223 kN working load)
 
 // ---------------------------------------------------------------- water pillows
 const cells = [];
@@ -723,7 +723,6 @@ const platMats = {
   soil:   platMat(0x4a3a28, { rough:1 }),
   rail:   platMat(0x3e3c3a, { rough:0.4, metal:0.65 }),
   hand:   platMat(0x6b5340, { rough:0.7 }),
-  cable:  platMat(0xd8d4cc, { rough:0.35, metal:0.7 }),
   well:   platMat(0x6a6660, { rough:0.45, metal:0.5 }),
   lamp:   new THREE.MeshStandardMaterial({ color:0x222222, emissive:0xffb46b, emissiveIntensity:0, roughness:0.5 }),
 };
@@ -732,8 +731,7 @@ const platTreeMats = [
 ];
 clipList.push(platMats.lamp);   // lamp heads should clip in section too (no interior tint needed)
 const platformGroup = new THREE.Group(); scene.add(platformGroup);
-const platCableGeo = new THREE.CylinderGeometry(1, 1, 1, 6, 1); platCableGeo.translate(0, 0.5, 0);
-const platCables = new THREE.InstancedMesh(platCableGeo, platMats.cable, PLATFORM_HANG.length);
+const platCables = new THREE.InstancedMesh(tetherGeoHi, clippable(tetherMat.clone()), PLATFORM_HANG.length);
 platCables.castShadow = true; platCables.frustumCulled = false; platformGroup.add(platCables);
 const platPostGeo = new THREE.CylinderGeometry(0.032, 0.036, PLATFORM_RAIL, 8); platPostGeo.translate(0, PLATFORM_RAIL/2, 0);
 const platPosts = new THREE.InstancedMesh(platPostGeo, platMats.rail, 32);
@@ -842,7 +840,7 @@ function rebuildPlatform(waterBottom, cut){
     const a = Math.atan2(nz, nx);
     const a0 = new THREE.Vector3(PLATFORM_CX + Math.cos(a)*(PLATFORM_R-0.12), deckY - 0.04, PLATFORM_CZ + Math.sin(a)*(PLATFORM_R-0.12));
     const b  = new THREE.Vector3(nx, nodeY, nz);
-    setCyl(platCables, nc++, a0, b, 0.022);
+    setCyl(platCables, nc++, a0, b, TETHER_R);
   }
   platCables.count = nc; platCables.instanceMatrix.needsUpdate = true;
   // person on the deck (visible side of the cut: z < CUT_Z) for scale next to the 1.1 m fence
