@@ -5,18 +5,6 @@
 <link rel="icon" href="data:,">
 <title>MARSOUPILAMI – Martian Overpressure Utility Pillow &amp; Laminated Membrane Infrastructure</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Tethered membrane dome at 0.85 atm with 8 m of hanging water pillows for radiation shielding. An interactive 3D model.">
-<meta property="og:title" content="MARSOUPILAMI – a water-shielded Mars dome">
-<meta property="og:description" content="Tethered membrane dome at 0.85 atm with 8 m of hanging water pillows for radiation shielding. An interactive 3D model.">
-<meta property="og:image" content="https://princemyschkin.github.io/marsoupilami/preview.png">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta property="og:url" content="https://princemyschkin.github.io/marsoupilami/">
-<meta property="og:type" content="website">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="MARSOUPILAMI – a water-shielded Mars dome">
-<meta name="twitter:description" content="Tethered membrane dome at 0.85 atm with 8 m of hanging water pillows for radiation shielding. An interactive 3D model.">
-<meta name="twitter:image" content="https://princemyschkin.github.io/marsoupilami/preview.png">
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   #info{position:absolute;z-index:10;left:10px;top:10px;width:330px;max-height:calc(100% - 20px);overflow:auto;
@@ -45,6 +33,9 @@
   #loading .bar i{display:block;height:100%;width:0;background:#ffc98a;transition:width .12s}
   #loading .msg{margin-top:10px;font-size:12px;color:#c9b6a4;min-height:1em}
   #hide{position:absolute;left:10px;bottom:10px;color:#aaa;font-size:11px;background:rgba(0,0,0,.5);padding:3px 7px;border-radius:4px;cursor:pointer}
+  #ptStats{display:none;position:absolute;right:10px;bottom:10px;z-index:20;color:#f3e6d8;font-size:12px;
+           background:rgba(12,10,9,.72);padding:5px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.14);
+           font-variant-numeric:tabular-nums;pointer-events:none;letter-spacing:.02em}
   #infoToggle{display:flex;margin:0 0 8px;border:1px solid rgba(255,255,255,.18);border-radius:6px;overflow:hidden;flex:0 0 auto}
   #infoToggle button{flex:1;appearance:none;-webkit-appearance:none;margin:0;border:0;background:transparent;color:#c8b8a8;
     font:inherit;font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;padding:5px 8px;cursor:pointer}
@@ -60,7 +51,10 @@
 { "imports": {
   "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
   "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
-  "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.min.js"
+  "three/examples/": "https://unpkg.com/three@0.160.0/examples/",
+  "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.min.js",
+  "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.4/build/index.module.js",
+  "three-gpu-pathtracer": "https://cdn.jsdelivr.net/npm/three-gpu-pathtracer@0.0.23/build/index.module.js"
 } }
 </script>
 </head>
@@ -76,6 +70,7 @@
   <div id="infoBody"></div>
 </div>
 <div id="hide">toggle info (i)</div>
+<div id="ptStats">Path trace · compiling…</div>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -83,6 +78,25 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import GUI from 'lil-gui';
+import { WebGLPathTracer, GradientEquirectTexture } from 'three-gpu-pathtracer';
+
+// three-gpu-pathtracer 0.0.23 reads scene.backgroundRotation / environmentRotation (added in three r163).
+// Polyfill them on r160 so we can keep the existing raster renderer unchanged.
+(function polyfillSceneRotation(){
+  const proto = THREE.Scene.prototype;
+  if (!Object.getOwnPropertyDescriptor(proto, 'backgroundRotation')){
+    Object.defineProperty(proto, 'backgroundRotation', {
+      get(){ return this._ptBgRot || (this._ptBgRot = new THREE.Euler()); },
+      set(v){ this._ptBgRot = v; },
+    });
+  }
+  if (!Object.getOwnPropertyDescriptor(proto, 'environmentRotation')){
+    Object.defineProperty(proto, 'environmentRotation', {
+      get(){ return this._ptEnvRot || (this._ptEnvRot = new THREE.Euler()); },
+      set(v){ this._ptEnvRot = v; },
+    });
+  }
+})();
 
 // ============================================================================
 //  GEOMETRY PARAMETERS (metres)
@@ -188,11 +202,58 @@ function sunVector(hours, latDeg, declDeg){
         U=Math.sin(d)*Math.sin(f)+Math.cos(d)*Math.cos(f)*Math.cos(H);
   return new THREE.Vector3(E, U, -N).normalize();   // x = east, y = up, z = south
 }
+// Mars dust, solar band: single-scatter albedo and asymmetry (Wolff et al. 2009,
+// Madeleine et al. 2011; mid-visible / solar-weighted values are ~0.93–0.95 and
+// ~0.65–0.7). Surface broadband albedo ~0.2 (typical TES / Lambert mean).
+const DUST_SSA = 0.94, DUST_G = 0.70, DUST_ALB = 0.20;
+// Total downward flux at the surface (direct + diffuse) from a δ-Eddington
+// two-stream (Joseph, Wiscombe & Weinman 1976; Meador & Weaver 1980).
+// The beam in this solution is the δ-scaled “direct”; callers split off the
+// true Beer–Lambert sun-disk (unscaled τ) and treat the rest as diffuse.
+function dustTwoStreamDown(mu0, tau){
+  mu0 = Math.min(Math.max(mu0, 1e-3), 1);
+  const omega = Math.min(DUST_SSA, 0.999999), g = DUST_G, alb = DUST_ALB;
+  const f = g*g;
+  const taup = (1 - omega*f) * tau;
+  let omegap = (1 - omega*f) > 1e-12 ? (1-f)*omega / (1 - omega*f) : 0;
+  omegap = Math.min(omegap, 0.999999);
+  const gp = g / (1 + g);
+  const y1 = (7 - omegap*(4 + 3*gp))/4;
+  const y2 = -(1 - omegap*(4 - 3*gp))/4;
+  const y3 = (2 - 3*gp*mu0)/4;
+  const y4 = 1 - y3;
+  const lam = Math.sqrt(Math.max(y1*y1 - y2*y2, 0)) || 1e-8;
+  let mu = mu0, den = lam*lam - 1/(mu*mu);
+  if (Math.abs(den) < 1e-7){
+    mu = mu0 * (mu0 > 0.5 ? 0.998 : 1.002);
+    den = lam*lam - 1/(mu*mu);
+    if (Math.abs(den) < 1e-7) den = den >= 0 ? 1e-7 : -1e-7;
+  }
+  const src = omegap * S0, invm = 1/mu;
+  const P = src * ((y1 - invm)*y3 + y2*y4) / den;
+  const Q = src * ((y1 + invm)*y4 + y2*y3) / den;
+  const Rp = Math.abs(y2) < 1e-12 ? 0 : (y1 - lam)/y2;
+  const Rm = Math.abs(y2) < 1e-12 ? 0 : (y1 + lam)/y2;
+  const eLam = Math.exp(-Math.min(lam*taup, 80));
+  const eSun = Math.exp(-Math.min(taup/mu, 80));
+  const rhs = alb*(Q*eSun + S0*mu*eSun) - P*eSun;
+  const a11 = Rp*eLam, a12 = Rm, b1 = -Q;
+  const a21 = 1 - alb*Rp, a22 = eLam*(1 - alb*Rm), b2 = rhs;
+  const det = a11*a22 - a12*a21;
+  const U = Math.abs(det) < 1e-18 ? 0 : (b1*a22 - a12*b2)/det;
+  const V = Math.abs(det) < 1e-18 ? 0 : (a11*b2 - b1*a21)/det;
+  const downDif = U*Rp + V*Rm*eLam + Q*eSun;
+  return Math.max(0, downDif + S0*mu*eSun);
+}
 function irradiance(mu, tau){   // mu = sin(elevation)
   if (mu <= 0) { const tw = S0*0.012*THREE.MathUtils.smoothstep(mu, -0.3, 0); return {dni:0, dir:0, dif:tw, glob:tw}; }
   const m = Math.max(mu, 0.035), tr = Math.exp(-tau/m);
-  const dni = S0*tr, dir = dni*mu, dif = S0*mu*(1-tr)*0.75;  // dust: high single-scatter albedo, forward scattering
-  return { dni, dir, dif, glob: dir+dif };
+  const dni = S0*tr, dir = dni*m;
+  // Diffuse = two-stream global minus the unscattered beam. At τ ≤ 1 this stays
+  // close to the old 0.75·S₀μ(1−e^{−τ/μ}) fit; at τ ≈ 11 it no longer saturates
+  // at 75 % of TOA (that fit stayed bright even in a global storm).
+  const glob = dustTwoStreamDown(m, tau), dif = Math.max(0, glob - dir);
+  return { dni, dir, dif, glob: dir + dif };
 }
 const LUM_EFF = 100;  // lm/W, broadband sunlight
 const PAR_PER_W = 2.06; // µmol photons PAR per J of broadband sunlight
@@ -201,7 +262,7 @@ const PAR_PER_W = 2.06; // µmol photons PAR per J of broadband sunlight
 //  RENDERER / SCENE
 // ============================================================================
 const params = {
-  height: 22.0, layers: 8, pillows: true, platform: true, tunnels: false, tunnelSpacing: 10, funnelCover: 100, perfOpen: 20, membrane: true, tethers: true, cutaway: true, labels: true,
+  height: 22.0, layers: 8, pillows: true, platform: true, tunnels: false, tunnelSpacing: 10, funnelCover: 100, perfOpen: 20, membrane: true, tethers: true, cutaway: true, cutEighth: false, labels: true,
   time: 11.0, pathLights: 'auto', lat: 35, decl: 0, tau: 0.5, exposure: 1.0, view: 'overview', ledW: 0, ledHours: 16, ledAuto: true, ledMix620: 0.40,
 };
 const qs = new URLSearchParams(location.search);
@@ -249,6 +310,20 @@ function interior(mat){
 // cut plane: keep z <= 1 (the cell boundary just in front of the centre row)
 const CUT_Z = 1.0;
 const cutPlane = new THREE.Plane(new THREE.Vector3(0,0,-1), CUT_Z);
+// 1/8 (45°) sector cutaway, a wedge about the −Z axis (the usual look-into side of the half cut).
+const EIGHTH_HALF = Math.PI/8, EIGHTH_CENTER = -Math.PI/2;
+const eighthPlanes = [new THREE.Plane(), new THREE.Plane()];
+{ const t1 = EIGHTH_CENTER - EIGHTH_HALF, t2 = EIGHTH_CENTER + EIGHTH_HALF;
+  eighthPlanes[0].setFromNormalAndCoplanarPoint(new THREE.Vector3(Math.sin(t1), 0, -Math.cos(t1)), new THREE.Vector3());
+  eighthPlanes[1].setFromNormalAndCoplanarPoint(new THREE.Vector3(-Math.sin(t2), 0, Math.cos(t2)), new THREE.Vector3()); }
+function isCut(){ return !!(params.cutaway || params.cutEighth); }
+function inEighth(x, z){ return Math.abs(Math.atan2(x, -z)) <= EIGHTH_HALF + 1e-6; }
+function inCut(x, z){
+  if (params.cutEighth) return inEighth(x, z);
+  if (params.cutaway) return z <= CUT_Z;
+  return true;
+}
+function currentClipPlanes(){ return params.cutEighth ? eighthPlanes : (params.cutaway ? [cutPlane] : null); }
 const clipList = [];
 function clippable(mat){ clipList.push(mat); return mat; }
 
@@ -705,6 +780,17 @@ const PLATFORM_MIN_CLEAR = 25;   // clear interior height threshold
 const PLATFORM_MIN_BELOW = 8;    // headroom under the deck
 const PLATFORM_MIN_ABOVE = 7;    // headroom above the walking surface to the pillows (tree + clearance)
 const PLATFORM_CX = 0, PLATFORM_CZ = 0;
+// Rectangular hanging pool at 12 o'clock (toward −Z), between the centre
+// planter and the rail. 4 m runs tangentially (along X), 2 m radially (along Z).
+// Inset so the outer corners and the planter share ~1.22 m of clearance; a
+// through-deck well sits off to each side, not in this sector.
+const PLATFORM_POOL_W = 4.00;      // outer width (x, tangential), m
+const PLATFORM_POOL_L = 2.00;      // outer length (z, radial), m
+const PLATFORM_POOL_D = 1.10;      // water depth, m
+const PLATFORM_POOL_WALL = 0.025;  // acrylic wall / bottom, m
+const PLATFORM_POOL_FREE = 0.05;   // water surface below the deck top, m
+const PLATFORM_POOL_X = 0;
+const PLATFORM_POOL_Z = -3.265;
 const PLATFORM_HANG = [          // 8 stays to nearby tether attachment nodes, just under the pillow stack
   [7,1],[7,-1],[-7,1],[-7,-1],[1,7],[1,-7],[-1,7],[-1,-7]
 ];
@@ -726,6 +812,19 @@ const platMats = {
   well:   platMat(0x6a6660, { rough:0.45, metal:0.5 }),
   lamp:   new THREE.MeshStandardMaterial({ color:0x222222, emissive:0xffb46b, emissiveIntensity:0, roughness:0.5 }),
 };
+{ // hanging glass pool: clear acrylic basin + water (same IOR / absorption idea as the pillows)
+  const Tw = bandT(A_WATER.map(a => Math.exp(-a)));
+  const att = new THREE.Color(Math.max(Tw.r*T_BAG, 1e-4), Math.max(Tw.g*T_BAG, 1e-4), Math.max(Tw.b*T_BAG, 1e-4));
+  platMats.poolWater = clippable(interior(new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, roughness: 0.03, metalness: 0, transmission: 0.97,
+    thickness: PLATFORM_POOL_D, ior: N_WATER, transparent: false, opacity: 1,
+    attenuationColor: att, attenuationDistance: 1,
+  })));
+  platMats.poolGlass = clippable(interior(new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, roughness: 0.04, metalness: 0, transmission: 0.92,
+    thickness: PLATFORM_POOL_WALL, ior: 1.49, transparent: false, opacity: 1,
+  })));
+}
 const platTreeMats = [
   platMat(0x6b4a2f), platMat(0x3f6e2a, { flat:true }), platMat(0x4c7d31, { flat:true }), platMat(0x46772d, { flat:true }),
 ];
@@ -767,6 +866,101 @@ function clearPlatformDynamic(){
     o.traverse(c => { if (c.geometry) c.geometry.dispose(); });
   }
 }
+
+function poolOuterRect(gap=0){
+  const hx = PLATFORM_POOL_W/2 + gap, hz = PLATFORM_POOL_L/2 + gap;
+  return { x0: PLATFORM_POOL_X-hx, x1: PLATFORM_POOL_X+hx, z0: PLATFORM_POOL_Z-hz, z1: PLATFORM_POOL_Z+hz };
+}
+function pointHitsPool(x, z, margin=0){
+  const r = poolOuterRect(margin);
+  return x>=r.x0 && x<=r.x1 && z>=r.z0 && z<=r.z1;
+}
+function platformPoolWaterKg(){
+  const tw = PLATFORM_POOL_WALL, w = PLATFORM_POOL_W-2*tw-0.008, l = PLATFORM_POOL_L-2*tw-0.008, h = PLATFORM_POOL_D-0.01;
+  return w*l*h*1000;
+}
+function platformPoolBasinKg(){
+  const tw=PLATFORM_POOL_WALL, Wo=PLATFORM_POOL_W, Lo=PLATFORM_POOL_L, Wi=Wo-2*tw, Li=Lo-2*tw;
+  const innerH=PLATFORM_POOL_D+PLATFORM_POOL_FREE;
+  const vol = Wo*Lo*tw + 2*tw*innerH*Lo + 2*tw*innerH*Wi;
+  return vol*1180; // acrylic
+}
+// Closed water box. waves: subdivided top with 4–10 mm displacement (path-trace bake only).
+function poolWaterBoxGeometry(w, d, h, waves){
+  const nx = waves ? 24 : 1, nz = waves ? 24 : 1, y0 = -h/2, y1 = h/2;
+  const wave = (x,z) => waves ? 0.008*(Math.sin(x*5.3+0.6)*Math.cos(z*4.1) + 0.45*Math.sin(x*8.8-z*6.4+1.2)) : 0;
+  const pos = [], idx = [];
+  const vert = (x,y,z) => { pos.push(x,y,z); return pos.length/3-1; };
+  const top = [], bot = [];
+  for (let k=0;k<=nz;k++){
+    top[k]=[]; bot[k]=[];
+    const z = -d/2 + d*k/nz;
+    for (let i=0;i<=nx;i++){
+      const x = -w/2 + w*i/nx;
+      top[k][i] = vert(x, y1+wave(x,z), z);
+      bot[k][i] = vert(x, y0, z);
+    }
+  }
+  for (let k=0;k<nz;k++) for (let i=0;i<nx;i++){
+    const a=top[k][i], b=top[k][i+1], c=top[k+1][i], e=top[k+1][i+1];
+    idx.push(a,c,b, b,c,e);
+    const a2=bot[k][i], b2=bot[k][i+1], c2=bot[k+1][i], e2=bot[k+1][i+1];
+    idx.push(a2,b2,c2, b2,e2,c2);
+  }
+  // sides, CCW when viewed from outside
+  for (let i=0;i<nx;i++){ // −Z
+    const t0=top[0][i], t1=top[0][i+1], b0=bot[0][i], b1=bot[0][i+1];
+    idx.push(b0,b1,t1, b0,t1,t0);
+  }
+  for (let i=0;i<nx;i++){ // +Z
+    const k=nz, t0=top[k][i], t1=top[k][i+1], b0=bot[k][i], b1=bot[k][i+1];
+    idx.push(b1,b0,t0, b1,t0,t1);
+  }
+  for (let k=0;k<nz;k++){ // −X
+    const t0=top[k][0], t1=top[k+1][0], b0=bot[k][0], b1=bot[k+1][0];
+    idx.push(b1,b0,t0, b1,t0,t1);
+  }
+  for (let k=0;k<nz;k++){ // +X
+    const i=nx, t0=top[k][i], t1=top[k+1][i], b0=bot[k][i], b1=bot[k+1][i];
+    idx.push(b0,b1,t1, b0,t1,t0);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+function addPlatformPool(deckY){
+  const tw = PLATFORM_POOL_WALL, Wo = PLATFORM_POOL_W, Lo = PLATFORM_POOL_L;
+  const Wi = Wo-2*tw, Li = Lo-2*tw, innerH = PLATFORM_POOL_D + PLATFORM_POOL_FREE;
+  const cx = PLATFORM_CX+PLATFORM_POOL_X, cz = PLATFORM_CZ+PLATFORM_POOL_Z;
+  const basin = new THREE.Group();
+  basin.name = 'platPoolBasin';
+  const addBox = (geo, x, y, z) => {
+    const m = new THREE.Mesh(geo, platMats.poolGlass);
+    m.position.set(x,y,z);
+    m.castShadow = m.receiveShadow = true;
+    basin.add(m);
+  };
+  // Five non-overlapping boxes: bottom plate + four walls sitting on it (no shared volume, no z-fight).
+  addBox(new THREE.BoxGeometry(Wo, tw, Lo), cx, deckY - innerH - tw/2, cz);
+  addBox(new THREE.BoxGeometry(tw, innerH, Lo), cx + (Wi/2 + tw/2), deckY - innerH/2, cz);
+  addBox(new THREE.BoxGeometry(tw, innerH, Lo), cx - (Wi/2 + tw/2), deckY - innerH/2, cz);
+  addBox(new THREE.BoxGeometry(Wi, innerH, tw), cx, deckY - innerH/2, cz + (Li/2 + tw/2));
+  addBox(new THREE.BoxGeometry(Wi, innerH, tw), cx, deckY - innerH/2, cz - (Li/2 + tw/2));
+  platformGroup.add(basin);
+  const waterH = PLATFORM_POOL_D - 0.01, waterW = Wi - 0.008, waterL = Li - 0.008;
+  const water = new THREE.Mesh(poolWaterBoxGeometry(waterW, waterL, waterH, false), platMats.poolWater);
+  water.name = 'platPoolWater';
+  water.userData.poolWaterW = waterW;
+  water.userData.poolWaterL = waterL;
+  water.userData.poolWaterH = waterH;
+  water.position.set(cx, deckY - PLATFORM_POOL_FREE - waterH/2, cz);
+  water.receiveShadow = true;
+  platformGroup.add(water);
+  platformGroup.userData.poolKg = platformPoolWaterKg();
+  platformGroup.userData.poolBasinKg = platformPoolBasinKg();
+}
 function rebuildPlatform(waterBottom, cut){
   const clear = waterBottom;
   const show = params.platform && clear > PLATFORM_MIN_CLEAR;
@@ -793,6 +987,12 @@ function rebuildPlatform(waterBottom, cut){
   }
   const shape = new THREE.Shape(); shape.absarc(0, 0, PLATFORM_R, 0, Math.PI*2, false);
   for (const [hx,hz] of holes){ const hole = new THREE.Path(); hole.absarc(hx, hz, 0.22, 0, Math.PI*2, true); shape.holes.push(hole); }
+  // matching rectangular cutout for the hanging glass pool; tree, person and fence stay put
+  { const r = poolOuterRect(0.003); // 3 mm gap so the slab does not z-fight the acrylic
+    const hole = new THREE.Path();
+    hole.moveTo(r.x0, r.z0); hole.lineTo(r.x1, r.z0); hole.lineTo(r.x1, r.z1); hole.lineTo(r.x0, r.z1); hole.closePath();
+    shape.holes.push(hole);
+  }
   const deckGeo = new THREE.ExtrudeGeometry(shape, { depth: PLATFORM_T, bevelEnabled:false, curveSegments: 48 });
   deckGeo.rotateX(Math.PI/2);   // shape (x,y) -> world (x,z); extrusion goes downward so the top sits at y=0
   const deck = new THREE.Mesh(deckGeo, platMats.deck);
@@ -802,9 +1002,11 @@ function rebuildPlatform(waterBottom, cut){
   let nw = 0;
   for (const [hx,hz] of holes){
     if (nw >= 24) break;
+    if (pointHitsPool(hx, hz, 0.25)) continue;
     M4.makeTranslation(PLATFORM_CX+hx, deckY, PLATFORM_CZ+hz); platWells.setMatrixAt(nw++, M4);
   }
   platWells.count = nw; platWells.instanceMatrix.needsUpdate = true;
+  addPlatformPool(deckY);
   // planter + slightly smaller tree in the middle
   const plantH = 0.42, plantR = 1.05;
   const planter = new THREE.Mesh(new THREE.CylinderGeometry(plantR, plantR+0.05, plantH, 32), platMats.planter);
@@ -852,8 +1054,22 @@ function rebuildPlatform(waterBottom, cut){
   for (const head of platformLampMeshes) head.position.set(PLATFORM_CX + head.userData.rx, deckY + PLATFORM_RAIL + 0.04, PLATFORM_CZ + head.userData.rz);
   for (const L of platformLights){
     if (L.userData.kind === 'rail') L.position.set(PLATFORM_CX + L.userData.rx, deckY + PLATFORM_RAIL + 0.04, PLATFORM_CZ + L.userData.rz);
-    else L.position.set(PLATFORM_CX + L.userData.rx, deckY - PLATFORM_T - 0.08, PLATFORM_CZ + L.userData.rz);
-    L.visible = !(cut && L.position.z > CUT_Z);
+    else {
+      let x = L.userData.rx, z = L.userData.rz;
+      if (pointHitsPool(x, z, 0.35)){
+        const r = poolOuterRect(0.35), cand = [[x,r.z0],[x,r.z1],[r.x0,z],[r.x1,z]];
+        let best=null, bestScore=-1e9;
+        for (const [px,pz] of cand){
+          const pr = Math.hypot(px,pz);
+          if (pr > PLATFORM_R-0.5 || pr < 1.35) continue;
+          const score = Math.min(pr-1.05, (PLATFORM_R-0.07)-pr);
+          if (score>bestScore){ bestScore=score; best=[px,pz]; }
+        }
+        if (best){ x=best[0]; z=best[1]; }
+      }
+      L.position.set(PLATFORM_CX + x, deckY - PLATFORM_T - 0.08, PLATFORM_CZ + z);
+    }
+    L.visible = !cut || inCut(L.position.x, L.position.z);
   }
   lblPlatform.position.set(PLATFORM_CX - 0.5, deckY + 2.0, 1.15);
   lblPlatform.element.textContent = `suspended platform 12 m Ø at ${fmtH(deckY)} m`;
@@ -907,7 +1123,7 @@ function domeVolume(){ // ∫ 2πr·h(r) dr (bulges ignored)
 }
 function rebuild(){
   const L = params.pillows ? params.layers : 0;
-  const cut = params.cutaway;
+  const cut = isCut();
   // pillows
   let n = 0, nStrap = 0, pillowCount = 0, water = 0, nT = 0, pipeLenSum = 0;
   const TL = tunnelLayout(L);
@@ -919,7 +1135,7 @@ function rebuild(){
       const nlN = Math.min(L, Math.floor((c.top - TL.dep - 0.3)/G.layerH));
       const bottom = Math.max(0.3, Math.min(pipeTop - 0.3, c.top - TL.dep - Math.max(nlN,1)*G.layerH - 0.05));
       pipeLenSum += mouthY - bottom;
-      if (!(cut && c.z > CUT_Z - 1)){
+      if (!cut || inCut(c.x, c.z)){
         M4.compose(new THREE.Vector3(c.x, bottom, c.z), Q.identity(), new THREE.Vector3(1, pipeTop - bottom, 1)); pipes.setMatrixAt(nT, M4);
         M4.makeTranslation(c.x, pipeTop, c.z); throats.setMatrixAt(nT, M4);
         M4.makeTranslation(c.x, bottom - 0.005, c.z); diffusers.setMatrixAt(nT, M4); nT++;
@@ -927,7 +1143,7 @@ function rebuild(){
       continue;
     }
     pillowCount += Math.max(0,nl); water += Math.max(0,nl) * G.cell*G.cell*G.layerH;
-    if (cut && c.z > CUT_Z - 1) continue;
+    if (cut && !inCut(c.x, c.z)) continue;
     if (nl > 0){
       setCyl(straps, nStrap++, new THREE.Vector3(c.x, top - 0.02, c.z), new THREE.Vector3(c.x, c.apex, c.z), 1);
       for (let l=0; l<nl; l++){
@@ -953,7 +1169,7 @@ function rebuild(){
   const lit = anchors.map((a,i)=>({a,r:Math.hypot(a.x,a.z)})).sort((p,q)=>p.r-q.r);
   let uLit = 0;
   for (const a of anchors){
-    if (cut && a.z > CUT_Z) continue;
+    if (cut && !inCut(a.x, a.z)) continue;
     M4.makeTranslation(a.x, 0, a.z); footings.setMatrixAt(nf, M4); collars.setMatrixAt(nf, M4); upLenses.setMatrixAt(nf, M4); nf++;
     if (!params.tethers) continue;
     for (const [x,z] of a.pts){
@@ -972,7 +1188,7 @@ function rebuild(){
   }
   for (const {a} of lit){
     if (uLit >= MAX_UPLIGHTS) break;
-    if (cut && a.z > CUT_Z) continue;
+    if (cut && !inCut(a.x, a.z)) continue;
     const sl = upLights[uLit++];
     sl.position.set(a.x, FOOT_H+0.05, a.z); sl.target.position.set(a.x, Math.max(10, G.H), a.z);
     sl.target.updateMatrixWorld(); sl.visible = true;
@@ -981,7 +1197,7 @@ function rebuild(){
   tethers.instanceMatrix.needsUpdate = footings.instanceMatrix.needsUpdate = collars.instanceMatrix.needsUpdate = true;
   tetherLines.geometry.setDrawRange(0, li/3); tetherLines.geometry.attributes.position.needsUpdate = true;
   tetherLines.visible = params.tethers;
-  for (const m of clipList) m.clippingPlanes = cut ? [cutPlane] : null, m.needsUpdate = true;
+  for (const m of clipList) m.clippingPlanes = currentClipPlanes(), m.needsUpdate = true;
   membraneGroup.visible = params.membrane;
   labelGroup.visible = params.labels && cut;
   labelGroup.children.forEach(o => { if (o.isCSS2DObject) o.visible = labelGroup.visible; });
@@ -994,6 +1210,7 @@ function rebuild(){
     fM: nTun*Math.PI*(PIPE_D/2)**2/Aroof, pipeLen: nTun ? pipeLenSum/nTun : 0, pillowCount, water, waterBottom, maxFit: Math.floor((G.H - G.hookGap - 0.3)/G.layerH), volume: domeVolume(),
     nAnchors: anchors.length, nTethers: nTeth, canopyA: Aroof, canopyR };
   rebuildPlatform(waterBottom, cut);
+  if (typeof ptOnRebuild === 'function') ptOnRebuild();
   updateLight();
 }
 
@@ -1236,6 +1453,7 @@ function updateLight(){
    <tr><td>Pillow layers × thickness</td><td class="v">${L} × ${G.layerH} m</td></tr>
    <tr><td>Clear height under water (plateau)</td><td class="v">${stats.waterBottom>0.3 ? fmt(stats.waterBottom,1)+' m' : '<span style="color:#ff8a6a">none</span>'}</td></tr>
    ${platformGroup.visible ? `<tr><td>Suspended platform Ø / walking surface</td><td class="v">${fmt(2*PLATFORM_R,0)} m / ${fmt(platformGroup.userData.deckY,1)} m</td></tr>` : ''}
+   ${platformGroup.visible ? `<tr><td>Platform pool (${fmt(PLATFORM_POOL_W,2)} × ${fmt(PLATFORM_POOL_L,2)} × ${fmt(PLATFORM_POOL_D,2)} m water)</td><td class="v">${fmt(platformGroup.userData.poolKg||0,0)} kg water + ${fmt(platformGroup.userData.poolBasinKg||0,0)} kg basin</td></tr>` : ''}
    <tr><td>Pillows rendered / water</td><td class="v">${fmt(stats.pillowCount)} / ${fmt(stats.water)} t</td></tr>
    <tr><td>Nominal water (${L} m over all cells)</td><td class="v">${fmt(cells.length*G.cell*G.cell*L)} t</td></tr>
    ${L>stats.maxFit ? `<tr><td colspan="2" style="color:#ff8a6a">⚠ ${L} m of water does not fit under a ${G.H} m dome: rendered stacks are clamped at the ground (max ${stats.maxFit} layers). Pressure, shielding and light figures use the nominal ${L} m.</td></tr>` : ''}
@@ -1276,7 +1494,7 @@ function updateLight(){
   </table>
   ${ledHTML}
   ${tunHTML}
-  <div class="src">Water absorption: Pope &amp; Fry 1997, Appl. Opt. 36:8710 (400–700 nm, 10 nm steps; e.g. 450 nm 0.0092, 550 nm 0.0565, 650 nm 0.340, 700 nm 0.624 m⁻¹). Spectral Beer–Lambert with refraction into water (n=1.333), integrated with a 5778 K solar spectrum and CIE 1931 CMFs → linear sRGB, luminance and PAR photons. Mars: S₀=590 W/m², direct = S₀·e^(−τ/μ), diffuse ≈ 0.75·S₀μ(1−e^(−τ/μ)); 100 lm/W, 2.06 µmol/J. Dust colour of sun/sky is qualitative. Pillow geometry, tether count and loads are a conceptual layout, not a structural design.</div>`;
+  <div class="src">Water absorption: Pope &amp; Fry 1997, Appl. Opt. 36:8710 (400–700 nm, 10 nm steps; e.g. 450 nm 0.0092, 550 nm 0.0565, 650 nm 0.340, 700 nm 0.624 m⁻¹). Spectral Beer–Lambert with refraction into water (n=1.333), integrated with a 5778 K solar spectrum and CIE 1931 CMFs → linear sRGB, luminance and PAR photons. Mars: S₀=590 W/m², direct = S₀·e^(−τ/μ). Diffuse is the remainder of a δ-Eddington two-stream downward flux (Joseph, Wiscombe &amp; Weinman 1976, J. Atmos. Sci. 33:2452; Meador &amp; Weaver 1980, J. Atmos. Sci. 37:630) with solar-band dust ω₀=0.94, g=0.70 (Wolff et al. 2009; Madeleine et al. 2011) and surface albedo 0.20. At τ≤1 this stays within a few percent of the older 0.75·S₀μ(1−e^(−τ/μ)) fit; at τ=10.8 (Opportunity, June 2018) it falls to ~8 % of TOA instead of saturating at 75 %. 100 lm/W, 2.06 µmol/J. Dust colour of sun/sky is qualitative. Pillow geometry, tether count and loads are a conceptual layout, not a structural design.</div>`;
 
   const domeLine = `Dome: Ø ${fmt(2*G.R)} m · ${fmt(L*G.layerH,0)} m water sky · ${stats.waterBottom>0.3 ? fmt(stats.waterBottom,0)+' m clear' : '0 m clear'}`;
   const forcesLine = `Forces: ${fmt(dp,1)} kPa air ↑ = ${fmt(waterKPa,1)} kPa water ↓ + ${fmt(net,1)} kPa tethers ↓`;
@@ -1345,7 +1563,8 @@ function applyCamera(name){
 }
 function setView(name){
   const v = applyCamera(name); if (!v) return;
-  params.cutaway = v.cut; gui?.controllersRecursive().forEach(c=>c.updateDisplay());
+  if (!params.cutEighth) params.cutaway = v.cut;
+  gui?.controllersRecursive().forEach(c=>c.updateDisplay());
   rebuild();
 }
 // ---------------------------------------------------------------- loading overlay
@@ -1378,7 +1597,7 @@ function rebuildStructure(){
   if (['overview','exterior','section','platform'].includes(params.view)) applyCamera(params.view);
   rebuild();
 }
-window.__mars = { params, get rebuildHeight(){ return rebuildHeight; }, get rebuildLayers(){ return rebuildLayers; }, rebuild, rebuildStructure, plateauClearHeight, platformDeckY, platformGroup, camera, controls, applyCamera, get ledAutoState(){ return ledAutoState; }, computeLedAuto, updateLight, get infoMode(){ return infoMode; }, setInfoMode, get summary(){ return window.__summary; }, get anchors(){ return anchors; }, get stats(){ return stats; }, tetherCount, buildAnchors };   // test hook
+window.__mars = { params, renderer, get rebuildHeight(){ return rebuildHeight; }, get rebuildLayers(){ return rebuildLayers; }, rebuild, rebuildStructure, plateauClearHeight, platformDeckY, platformGroup, camera, controls, applyCamera, get ledAutoState(){ return ledAutoState; }, computeLedAuto, updateLight, interiorTransmission, irradiance, sunVector, waterT, get infoMode(){ return infoMode; }, setInfoMode, get summary(){ return window.__summary; }, get anchors(){ return anchors; }, get stats(){ return stats; }, tetherCount, buildAnchors };   // test hook
 const rebuildLayers = debounce(() => withLoading('rebuild', [['Hanging water pillows', 0.5, rebuild]]), 250);
 const gui = new GUI({ title: 'MARSOUPILAMI controls' });
 gui.add(params, 'height', H_MIN, H_MAX, 0.5).name('membrane height (m)').onChange(rebuildHeight);
@@ -1399,18 +1618,549 @@ fT.add(params, 'perfOpen', 0, 60, 1).name('perforation open %').onChange(updateL
 fT.hide();   // tunnels stay available via ?tunnels=1, but the folder is hidden from the control panel
 gui.add(params, 'membrane').name('show membrane').onChange(rebuild);
 gui.add(params, 'tethers').name('show tethers').onChange(rebuild);
-gui.add(params, 'cutaway').name('cutaway section').onChange(rebuild);
+gui.add(params, 'cutaway').name('cutaway section').onChange(() => {
+  if (!params.cutaway) params.cutEighth = false;
+  gui.controllersRecursive().forEach(c=>c.updateDisplay());
+  rebuild();
+});
+gui.add(params, 'cutEighth').name('1/8 sector cutaway').onChange(() => {
+  if (params.cutEighth) params.cutaway = true;
+  gui.controllersRecursive().forEach(c=>c.updateDisplay());
+  rebuild();
+});
 gui.add(params, 'labels').name('labels').onChange(rebuild);
 const fS = gui.addFolder('Sun / Mars time');
 fS.add(params, 'time', 0, 24, 0.05).name('local solar time (h)').onChange(updateLight);
 fS.add(params, 'pathLights', ['auto','on','off']).name('night lights (path + uplights)').onChange(updateLight);
 fS.add(params, 'lat', -60, 60, 1).name('latitude °N').onChange(updateLight);
 fS.add(params, 'decl', -25.2, 25.2, 0.1).name('solar declination °').onChange(updateLight);
-fS.add(params, 'tau', 0.2, 3, 0.05).name('dust optical depth τ').onChange(updateLight);
+fS.add(params, 'tau', 0.2, 11, 0.05).name('dust optical depth τ').onChange(updateLight);
 fS.add(params, 'exposure', 0.2, 4, 0.05).name('camera exposure').onChange(updateLight);
 gui.add(params, 'view', Object.keys(VIEWS).filter(k => k !== 'funnel')).name('camera preset').onChange(setView);
 let animT = null;
 gui.add({ play(){ if (animT){ clearInterval(animT); animT=null; } else animT=setInterval(()=>{ params.time=(params.time+0.05)%24; fS.controllers[0].updateDisplay(); updateLight(); }, 50); } }, 'play').name('▶ animate sol');
+
+
+// ---------------------------------------------------------------- path tracer (optional, three-gpu-pathtracer 0.0.23 + three-mesh-bvh 0.7.4, three r160)
+// InstancedMesh is not supported by the path tracer, so visible instances are baked into static geometry
+// when a trace starts. Custom shaders (sky, interior tint, multiply-blend pillow filters) are skipped or
+// replaced: pillows/membrane use MeshPhysicalMaterial with transmission; the sky becomes a gradient env map.
+const pt = {
+  enabled: false, building: false, pathTracer: null, scene: null, env: null,
+  stats: { triangles: 0, meshes: 0, instancesExpanded: 0, bvhMs: 0, lights: 0, error: '' },
+  useTransmission: true, lastCam: '',
+  tiles: Math.max(1, Math.min(16, Math.round(Number(qs.get('ptTiles')) || 12))),
+  budgetMs: Number(qs.get('ptBudget')) > 0 ? Number(qs.get('ptBudget')) : 20,
+  bounces: Number(qs.get('ptBounces')) > 0 ? Number(qs.get('ptBounces')) : 5,
+  // transmissiveBounces are EXTRA crossings through transmissive surfaces (the
+  // 0.0.23 shader rewinds the bounce index so they do not consume `bounces`).
+  transmissiveBounces: (qs.has('ptTransBounces') && Number.isFinite(Number(qs.get('ptTransBounces'))) && Number(qs.get('ptTransBounces')) >= 0)
+    ? Math.round(Number(qs.get('ptTransBounces'))) : 16,
+  pauseUnfocused: true,
+  unfocused: false,
+  nextSubmitAt: 0,
+  lastSubmitAt: 0,
+  lastGpuMs: 0,
+  lastCpuMs: 0,
+  timerChecked: false,
+  timerExt: null,
+  gl: null,
+  pendingQuery: null,
+};
+const ptStatsEl = document.getElementById('ptStats');
+function ptCamKey(){
+  const p = camera.position, t = controls.target;
+  return [p.x,p.y,p.z,t.x,t.y,t.z,camera.fov,camera.aspect].map(v=>v.toFixed(4)).join(',');
+}
+function ptWaterAttColor(){
+  // 1 m of water, same band-integrated T as interiorTransmission / bandT (Pope & Fry).
+  // T_BAG is folded in once per metre (≈ one pillow on a vertical path).
+  const T = bandT(A_WATER.map(a => Math.exp(-a)));
+  return new THREE.Color(Math.max(T.r*T_BAG, 1e-4), Math.max(T.g*T_BAG, 1e-4), Math.max(T.b*T_BAG, 1e-4));
+}
+function ptMaterial(src){
+  if (!src) return new THREE.MeshStandardMaterial({ color:0x888888, roughness:0.8 });
+  const isPillow = src === pillowMat;
+  const isMembrane = src === membraneMat;
+  const isPoolWater = src === platMats.poolWater;
+  const isPoolGlass = src === platMats.poolGlass;
+  const wantGlass = pt.useTransmission && (isPillow || isMembrane || isPoolWater || isPoolGlass || src.isMeshPhysicalMaterial);
+  const m = wantGlass ? new THREE.MeshPhysicalMaterial() : new THREE.MeshStandardMaterial();
+  // Raster interior() tints lighting via a shader uniform, not material.color, so the
+  // copied albedo is already the untinted base. Do not pre-multiply Beer–Lambert here:
+  // the tracer already sends rays through the water volumes.
+  if (src.color) m.color.copy(src.color);
+  m.roughness = src.roughness ?? 0.8;
+  m.metalness = src.metalness ?? 0;
+  if (src.emissive && m.emissive) m.emissive.copy(src.emissive);
+  if (src.emissiveIntensity != null) m.emissiveIntensity = src.emissiveIntensity;
+  m.side = src.side ?? THREE.FrontSide;
+  m.vertexColors = !!src.vertexColors;
+  if (src.map) m.map = src.map;
+  if (wantGlass){
+    if (isPillow){
+      // 0.0.23 multiplies path throughput by (transmission * color) at every interface.
+      // The old cyan preview colour (0xb7e2ee) × transmission 0.92, raised to 16
+      // interfaces (8 layers in and out), left only ~0.14 % of red — the stack went
+      // black before volume absorption. Color must be white; absorption is only
+      // Beer–Lambert: T = exp(ln(attenuationColor) * dist / attenuationDistance),
+      // with dist the world-space path length through the closed pillow volume (m).
+      m.color.set(0xffffff);
+      m.roughness = 0.02;
+      m.metalness = 0;
+      m.transmission = 1;
+      m.thickness = PH;            // non-zero so the material is a volume, not a thin film
+      m.ior = N_WATER;
+      m.attenuationColor.copy(ptWaterAttColor());
+      m.attenuationDistance = 1;   // metres; attColor is the transmittance of 1 m
+      m.transparent = false;
+      m.opacity = 1;
+      m.emissive.set(0x000000);
+      m.emissiveIntensity = 0;
+    } else if (isMembrane){
+      // Thin film: the mesh is a single shell, not a closed 2 cm solid. A non-zero
+      // thickness (or finite attenuationDistance) would make the tracer treat the
+      // whole interior as IOR 1.4 until a back-face hit. Color is white so the
+      // membrane's T_MEMBRANE is the only surface attenuation.
+      m.color.set(0xffffff);
+      m.roughness = 0.08;
+      m.metalness = 0;
+      m.transmission = T_MEMBRANE;
+      m.thickness = 0;
+      m.ior = 1.4;
+      m.attenuationColor.set(0xffffff);
+      m.attenuationDistance = Infinity;
+      m.side = THREE.DoubleSide;
+      m.transparent = false;
+      m.opacity = 1;
+    } else if (isPoolWater){
+      // Same volume water as the pillows: white, T=1, Beer–Lambert via attColor / 1 m.
+      m.color.set(0xffffff);
+      m.roughness = 0.02;
+      m.metalness = 0;
+      m.transmission = 1;
+      m.thickness = PLATFORM_POOL_D;
+      m.ior = N_WATER;
+      m.attenuationColor.copy(ptWaterAttColor());
+      m.attenuationDistance = 1;
+      m.transparent = false;
+      m.opacity = 1;
+      m.emissive.set(0x000000);
+      m.emissiveIntensity = 0;
+    } else if (isPoolGlass){
+      // Closed 2.5 cm acrylic cup (real inner and outer surfaces), clear volume.
+      m.color.set(0xffffff);
+      m.roughness = 0.02;
+      m.metalness = 0;
+      m.transmission = 1;
+      m.thickness = PLATFORM_POOL_WALL;
+      m.ior = 1.49;
+      m.attenuationColor.set(0xffffff);
+      m.attenuationDistance = Infinity;
+      m.transparent = false;
+      m.opacity = 1;
+    } else {
+      m.transmission = src.transmission ?? 0.8;
+      m.thickness = src.thickness ?? 0.05;
+      m.ior = src.ior ?? 1.5;
+    }
+  }
+  return m;
+}
+function mergeInstancedMesh(im){
+  const src = im.geometry;
+  const srcPos = src.getAttribute('position');
+  const srcNrm = src.getAttribute('normal');
+  const srcIdx = src.index;
+  const n = im.count, vPer = srcPos.count, iPer = srcIdx ? srcIdx.count : vPer;
+  if (n <= 0 || vPer <= 0) return null;
+  const pos = new Float32Array(n * vPer * 3);
+  const nrm = srcNrm ? new Float32Array(n * vPer * 3) : null;
+  const idx = new Uint32Array(n * iPer);
+  const M = new THREE.Matrix4(), N = new THREE.Matrix3(), p = new THREE.Vector3(), q = new THREE.Vector3();
+  for (let i=0;i<n;i++){
+    im.getMatrixAt(i, M);
+    if (nrm) N.getNormalMatrix(M);
+    const vo = i*vPer, io = i*iPer;
+    for (let v=0;v<vPer;v++){
+      p.fromBufferAttribute(srcPos, v).applyMatrix4(M);
+      const o = (vo+v)*3; pos[o]=p.x; pos[o+1]=p.y; pos[o+2]=p.z;
+      if (nrm){ q.fromBufferAttribute(srcNrm, v).applyNormalMatrix(N); nrm[o]=q.x; nrm[o+1]=q.y; nrm[o+2]=q.z; }
+    }
+    if (srcIdx){ for (let k=0;k<iPer;k++) idx[io+k] = srcIdx.getX(k) + vo; }
+    else { for (let k=0;k<iPer;k++) idx[io+k] = vo + k; }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  if (nrm) g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  return g;
+}
+function filterGeometry(geo, keepTri, matrixWorld){
+  const src = geo.index ? geo.toNonIndexed() : geo.clone();
+  const pos = src.getAttribute('position');
+  const nrm = src.getAttribute('normal');
+  const col = src.getAttribute('color');
+  const keep = [];
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const mw = matrixWorld || new THREE.Matrix4();
+  for (let i=0;i<pos.count;i+=3){
+    a.fromBufferAttribute(pos,i).applyMatrix4(mw);
+    b.fromBufferAttribute(pos,i+1).applyMatrix4(mw);
+    c.fromBufferAttribute(pos,i+2).applyMatrix4(mw);
+    if (keepTri((a.x+b.x+c.x)/3, (a.y+b.y+c.y)/3, (a.z+b.z+c.z)/3)) keep.push(i,i+1,i+2);
+  }
+  if (!keep.length){ src.dispose(); return null; }
+  const n = keep.length;
+  const out = new THREE.BufferGeometry();
+  const p2 = new Float32Array(n*3);
+  const n2 = nrm ? new Float32Array(n*3) : null;
+  const c2 = col ? new Float32Array(n*col.itemSize) : null;
+  for (let i=0;i<n;i++){
+    const v = keep[i];
+    p2[i*3]=pos.getX(v); p2[i*3+1]=pos.getY(v); p2[i*3+2]=pos.getZ(v);
+    if (n2){ n2[i*3]=nrm.getX(v); n2[i*3+1]=nrm.getY(v); n2[i*3+2]=nrm.getZ(v); }
+    if (c2){ for (let k=0;k<col.itemSize;k++) c2[i*col.itemSize+k] = col.getComponent(v,k); }
+  }
+  out.setAttribute('position', new THREE.BufferAttribute(p2,3));
+  if (n2) out.setAttribute('normal', new THREE.BufferAttribute(n2,3));
+  if (c2) out.setAttribute('color', new THREE.BufferAttribute(c2, col.itemSize));
+  if (src !== geo) src.dispose();
+  return out;
+}
+function ptKeepTri(x,y,z){
+  // drop far desert (keeps the dome + a short apron) and honour the active cut
+  if (Math.hypot(x,z) > G.R + 40) return false;
+  if (!isCut()) return true;
+  if (params.cutEighth){
+    const a = Math.atan2(x, -z);
+    return Math.abs(a) <= EIGHTH_HALF + 0.04 || Math.hypot(x,z) < 1.2;
+  }
+  return z <= CUT_Z + 0.05;
+}
+function countTris(geo){
+  if (!geo) return 0;
+  return geo.index ? (geo.index.count/3) : (geo.attributes.position.count/3);
+}
+function bakePathTraceScene(){
+  const out = new THREE.Scene();
+  const stats = { triangles:0, meshes:0, instancesExpanded:0, lights:0 };
+  const matCache = new Map();
+  const ptMatOf = (src) => {
+    if (!matCache.has(src)) matCache.set(src, ptMaterial(src));
+    return matCache.get(src);
+  };
+  const addMesh = (geo, mat, matrix) => {
+    if (!geo) return;
+    const mesh = new THREE.Mesh(geo, mat);
+    if (matrix) mesh.applyMatrix4(matrix);
+    mesh.updateMatrixWorld(true);
+    out.add(mesh);
+    stats.meshes++;
+    stats.triangles += countTris(geo);
+  };
+  const skipName = new Set();
+  scene.traverse(obj => {
+    if (!obj.visible) return;
+    if (obj.isCSS2DObject || obj.isLine || obj.isLineSegments || obj.isSprite || obj.isLight) return;
+    if (obj.isSkinnedMesh) return;
+    const mat0 = Array.isArray(obj.material) ? obj.material[0] : obj.material;
+    if (mat0 && mat0.isShaderMaterial) return;              // procedural sky
+    if (mat0 && mat0.blending === THREE.MultiplyBlending) return; // pillow spectral filter (raster trick)
+    if (obj.isInstancedMesh){
+      if (obj.count <= 0) return;
+      const savedGeo = obj.geometry;
+      if (obj === pillows || obj === pillowFilter) obj.geometry = pillowGeoLo;
+      const g = mergeInstancedMesh(obj);
+      obj.geometry = savedGeo;
+      if (!g) return;
+      const sliced = isCut() ? filterGeometry(g, ptKeepTri) : g;
+      if (sliced !== g) g.dispose();
+      addMesh(sliced, ptMatOf(obj.material));
+      stats.instancesExpanded += obj.count;
+      return;
+    }
+    if (!obj.isMesh || !obj.geometry) return;
+    obj.updateMatrixWorld(true);
+    const needsSlice = isCut() || (obj.geometry === groundGeo);
+    let geo = obj.geometry;
+    if (obj.name === 'platPoolWater'){
+      const u = obj.userData;
+      geo = poolWaterBoxGeometry(u.poolWaterW, u.poolWaterL, u.poolWaterH, true);
+    }
+    if (needsSlice){
+      const sliced = filterGeometry(geo, ptKeepTri, obj.matrixWorld);
+      if (!sliced) return;
+      addMesh(sliced, ptMatOf(obj.material)); // already in world space
+      return;
+    }
+    addMesh(geo.clone(), ptMatOf(obj.material), obj.matrixWorld);
+  });
+  // lights: sun + LED canopy (area) + any visible spots. HemisphereLight is not supported; env map fills the sky.
+  scene.traverse(obj => {
+    if (!obj.isLight || !obj.visible) return;
+    if (obj.isHemisphereLight || obj.isAmbientLight) return;
+    if ((obj.isSpotLight || obj.isPointLight) && (!obj.intensity || obj.intensity <= 0)) return;
+    if (obj.isRectAreaLight && (!obj.intensity || obj.intensity <= 0)) return;
+    const L = obj.clone();
+    obj.updateMatrixWorld(true);
+    L.matrix.copy(obj.matrixWorld);
+    L.matrix.decompose(L.position, L.quaternion, L.scale);
+    if (obj.target){
+      obj.target.updateMatrixWorld(true);
+      L.target.position.setFromMatrixPosition(obj.target.matrixWorld);
+      out.add(L.target);
+    }
+    out.add(L);
+    stats.lights++;
+  });
+  if (!pt.env){
+    pt.env = new GradientEquirectTexture(256);
+    pt.env.topColor.setRGB(0.62, 0.42, 0.28);
+    pt.env.bottomColor.setRGB(0.86, 0.62, 0.40);
+    pt.env.exponent = 0.6;
+    pt.env.update();
+  }
+  out.background = pt.env;
+  out.environment = pt.env;
+  out.backgroundBlurriness = 0.15;
+  return { scene: out, stats };
+}
+function disposePtScene(s){
+  if (!s) return;
+  s.traverse(o => {
+    if (o.geometry && o.geometry.dispose) o.geometry.dispose();
+  });
+}
+function setPtStats(text){
+  if (!ptStatsEl) return;
+  ptStatsEl.style.display = pt.enabled || pt.building ? 'block' : 'none';
+  if (text) ptStatsEl.textContent = text;
+}
+function startPathTrace(){
+  if (pt.building) return;
+  pt.building = true;
+  pt.stats.error = '';
+  setPtStats('Path trace · building BVH…');
+  const t0 = performance.now();
+  let baked;
+  try { baked = bakePathTraceScene(); }
+  catch (e){
+    pt.building = false; pt.enabled = false; pt.stats.error = String(e && e.message || e);
+    setPtStats('Path trace · bake failed: ' + pt.stats.error);
+    console.error(e);
+    return;
+  }
+  const bakeMs = performance.now() - t0;
+  disposePtScene(pt.scene);
+  pt.scene = baked.scene;
+  Object.assign(pt.stats, baked.stats, { bakeMs: +bakeMs.toFixed(1) });
+  if (!pt.pathTracer){
+    const ptr = new WebGLPathTracer(renderer);
+    ptr.filterGlossyFactor = 0.5;
+    ptr.bounces = pt.bounces;
+    ptr.transmissiveBounces = pt.useTransmission ? pt.transmissiveBounces : 0;
+    ptr.renderScale = Number(qs.get('ptScale')) > 0 ? Number(qs.get('ptScale')) : 1;
+    ptr.tiles.set(pt.tiles, pt.tiles);
+    ptr.multipleImportanceSampling = true;
+    ptr.renderToCanvas = true;
+    ptr.rasterizeScene = false;
+    pt.pathTracer = ptr;
+  }
+  const t1 = performance.now();
+  try {
+    pt.pathTracer.setScene(pt.scene, camera);
+  } catch (e){
+    pt.building = false; pt.enabled = false; pt.stats.error = String(e && e.message || e);
+    setPtStats('Path trace · setScene failed: ' + pt.stats.error);
+    console.error(e);
+    return;
+  }
+  const bvhMs = performance.now() - t1;
+  pt.stats.bvhMs = +bvhMs.toFixed(1);
+  pt.stats.bakeMs = +bakeMs.toFixed(1);
+  pt.enabled = true;
+  pt.building = false;
+  pt.lastCam = ptCamKey();
+  pt.nextSubmitAt = 0;
+  applyPtTiles(false);
+  applyPtBounces(false);
+  applyPtTransBounces(false);
+  setPtStats(`Path trace · 0 samples · ${Math.round(pt.stats.triangles).toLocaleString()} tris · BVH ${pt.stats.bvhMs} ms`);
+  console.log('path trace scene', pt.stats);
+}
+function stopPathTrace(){
+  pt.enabled = false;
+  pt.building = false;
+  if (pt.pendingQuery && pt.gl){ try { pt.gl.deleteQuery(pt.pendingQuery); } catch(e){} }
+  pt.pendingQuery = null;
+  if (pt.pathTracer){ try { pt.pathTracer.reset(); } catch(e){} }
+  setPtStats('');
+  if (ptStatsEl) ptStatsEl.style.display = 'none';
+  if (ptCtl) { ptCtl.enabled = false; gui?.controllersRecursive().forEach(c=>c.updateDisplay()); }
+}
+function ptOnRebuild(){
+  if (pt.enabled || pt.building) startPathTrace();
+}
+window.__pt = pt;
+pt.start = startPathTrace;
+pt.stop = stopPathTrace;
+
+// Cooperative scheduling (no gl.finish):
+// PathTracingRenderer.update() already traces one scissored tile per call, then yields.
+// We submit at most one tile per animation frame. A tile is still a single
+// non-preemptible draw, so the budget only controls how often we submit, not
+// mid-tile work. If EXT_disjoint_timer_query_webgl2 is present, the last tile's
+// GPU time is read asynchronously (one frame late) and the next submit is delayed
+// so average GPU load stays near budgetMs per 16.7 ms. Without the extension, we
+// use a conservative heuristic: assume GPU time is at least max(cpuMs, 8 ms) × 2
+// and skip frames the same way.
+const PT_FRAME_MS = 1000 / 60;
+function applyPtTiles(reset=true){
+  const n = Math.max(1, Math.min(16, Math.round(pt.tiles)));
+  pt.tiles = n;
+  if (pt.pathTracer){
+    pt.pathTracer.tiles.set(n, n);
+    if (reset) pt.pathTracer.reset();
+  }
+}
+function applyPtBounces(reset=true){
+  if (!pt.pathTracer) return;
+  pt.pathTracer.bounces = pt.bounces;
+  if (reset) pt.pathTracer.reset();
+}
+// In three-gpu-pathtracer 0.0.23, transmissiveBounces is an extra allowance of
+// transmissive surface crossings (refraction / travel through a medium). The
+// shader decrements the path-loop index so these steps do not consume the
+// regular `bounces` budget. It is not a total path-length cap and not a subset
+// of `bounces`. Two interfaces per water pillow, so 8 layers need ~16+.
+function applyPtTransBounces(reset=true){
+  if (!pt.pathTracer) return;
+  pt.pathTracer.transmissiveBounces = pt.useTransmission ? pt.transmissiveBounces : 0;
+  if (reset) pt.pathTracer.reset();
+}
+function ptIsPaused(){
+  return document.hidden || (pt.pauseUnfocused && pt.unfocused);
+}
+function ptEnsureTimer(){
+  if (pt.timerChecked) return;
+  pt.timerChecked = true;
+  const gl = renderer.getContext();
+  pt.gl = gl;
+  pt.timerExt = (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext)
+    ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+}
+function ptBeginGpuQuery(){
+  if (!pt.timerExt || !pt.gl || pt.pendingQuery) return;
+  const gl = pt.gl, ext = pt.timerExt;
+  try {
+    if (gl.getQuery(ext.TIME_ELAPSED_EXT, gl.CURRENT_QUERY)) return;
+    const q = gl.createQuery();
+    gl.beginQuery(ext.TIME_ELAPSED_EXT, q);
+    if (gl.getQuery(ext.TIME_ELAPSED_EXT, gl.CURRENT_QUERY) !== q){
+      try { gl.deleteQuery(q); } catch (e) {}
+      return;
+    }
+    pt.pendingQuery = q;
+  } catch (e) { pt.pendingQuery = null; }
+}
+function ptEndGpuQuery(){
+  if (!pt.timerExt || !pt.gl || !pt.pendingQuery) return;
+  const gl = pt.gl, ext = pt.timerExt;
+  try {
+    if (gl.getQuery(ext.TIME_ELAPSED_EXT, gl.CURRENT_QUERY) === pt.pendingQuery){
+      gl.endQuery(ext.TIME_ELAPSED_EXT);
+    }
+  } catch (e) { try { gl.deleteQuery(pt.pendingQuery); } catch (e2) {} pt.pendingQuery = null; }
+}
+function ptTrustGpuMs(ms){
+  // Discard empty/broken timer results (some software GL reports ~0).
+  return Number.isFinite(ms) && ms >= 0.1;
+}
+function ptPollGpuQuery(){
+  if (!pt.timerExt || !pt.gl || !pt.pendingQuery) return;
+  const gl = pt.gl, q = pt.pendingQuery;
+  try {
+    if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) return;
+    const disjoint = gl.getParameter(pt.timerExt.GPU_DISJOINT_EXT);
+    if (!disjoint){
+      const ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+      if (ptTrustGpuMs(ms)){
+        pt.lastGpuMs = ms;
+        if (pt.lastSubmitAt){
+          const period = pt.lastGpuMs * (PT_FRAME_MS / Math.max(pt.budgetMs, 1));
+          pt.nextSubmitAt = pt.lastSubmitAt + period;
+        }
+      }
+    }
+    gl.deleteQuery(q);
+  } catch (e) {
+    try { gl.deleteQuery(q); } catch (e2) {}
+  }
+  pt.pendingQuery = null;
+}
+function ptPresentOnly(ptr){
+  const prev = ptr.pausePathTracing;
+  ptr.pausePathTracing = true;
+  ptr.renderSample();
+  ptr.pausePathTracing = prev;
+}
+function tickPathTrace(){
+  const ptr = pt.pathTracer;
+  if (!ptr || !pt.enabled || pt.building) return;
+  const key = ptCamKey();
+  if (key !== pt.lastCam){
+    pt.lastCam = key;
+    ptr.updateCamera();
+    pt.nextSubmitAt = 0;
+  }
+  const paused = ptIsPaused();
+  const now = performance.now();
+  if (paused){
+    ptPresentOnly(ptr);
+  } else {
+    ptPollGpuQuery();
+    if (now >= pt.nextSubmitAt){
+      ptEnsureTimer();
+      const t0 = performance.now();
+      ptBeginGpuQuery();
+      ptr.pausePathTracing = false;
+      try { ptr.renderSample(); } finally { ptEndGpuQuery(); }
+      pt.lastCpuMs = performance.now() - t0;
+      pt.lastSubmitAt = t0;
+      // Ignore one-shot stalls (shader compile) so they do not schedule a long skip.
+      if (ptr.isCompiling || pt.lastCpuMs > 80){
+        pt.nextSubmitAt = 0;
+      } else {
+        const assumedMs = ptTrustGpuMs(pt.lastGpuMs) ? pt.lastGpuMs : Math.max(pt.lastCpuMs, 8) * (pt.timerExt ? 1 : 2);
+        pt.nextSubmitAt = t0 + assumedMs * (PT_FRAME_MS / Math.max(pt.budgetMs, 1));
+      }
+    } else {
+      ptPresentOnly(ptr);
+    }
+  }
+  const samples = ptr.samples || 0;
+  const compiling = ptr.isCompiling ? ' · compiling shaders' : '';
+  const pauseLbl = paused ? ' · paused' : '';
+  const spp = Number.isInteger(samples) ? samples : Math.round(samples * 100) / 100;
+  setPtStats(`Path trace · ${spp} sample${samples===1?'':'s'}${pauseLbl}${compiling} · ${Math.round(pt.stats.triangles).toLocaleString()} tris`);
+}
+
+const ptCtl = { enabled: false };
+const fPT = gui.addFolder('Path trace');
+fPT.add(ptCtl, 'enabled').name('Path trace').onChange(v => {
+  if (v) startPathTrace(); else stopPathTrace();
+  ptCtl.enabled = pt.enabled;
+});
+fPT.add(pt, 'tiles', 1, 16, 1).name('tiles').onChange(() => applyPtTiles(true));
+fPT.add(pt, 'budgetMs', 4, 48, 1).name('GPU budget (ms)');
+fPT.add(pt, 'bounces', 1, 64, 1).name('bounces').onChange(() => applyPtBounces(true));
+fPT.add(pt, 'transmissiveBounces', 0, 64, 1).name('transmissive bounces').onChange(() => applyPtTransBounces(true));
+fPT.add(pt, 'pauseUnfocused').name('pause when unfocused');
+
+window.addEventListener('blur', () => { pt.unfocused = true; });
+window.addEventListener('focus', () => { pt.unfocused = false; });
+
 
 document.getElementById('hide').onclick = () => { const i=document.getElementById('info'); i.style.display = i.style.display==='none'?'':'none'; };
 document.getElementById('infoToggle').addEventListener('click', e => {
@@ -1420,9 +2170,11 @@ document.getElementById('infoToggle').addEventListener('click', e => {
 applyInfoModeChrome();
 addEventListener('keydown', e => { if (e.key==='i') document.getElementById('hide').onclick(); });
 addEventListener('resize', () => { camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight); labelRenderer.setSize(innerWidth, innerHeight); });
+  renderer.setSize(innerWidth, innerHeight); labelRenderer.setSize(innerWidth, innerHeight);
+  if (pt.enabled && pt.pathTracer) pt.pathTracer.updateCamera(); });
 
 const cutOverride = qs.has('cutaway') ? params.cutaway : null;
+const eighthFromUrl = qs.has('cutEighth') ? params.cutEighth : false;
 params.height = THREE.MathUtils.clamp(params.height, H_MIN, H_MAX);
 params.layers = THREE.MathUtils.clamp(Math.round(params.layers), 0, MAXL);
 if (qs.get('gui')==='0') gui.hide();
@@ -1430,14 +2182,21 @@ if (qs.get('info')==='0') document.getElementById('info').style.display='none';
 loadingEl.className = '';
 withLoading('', [...structureSteps(), ['Placing camera', 0.95, () => {
     setHeight(params.height); const v = applyCamera(params.view) || applyCamera('overview');
-    params.cutaway = cutOverride !== null ? cutOverride : v.cut; gui.controllersRecursive().forEach(c=>c.updateDisplay()); rebuild(); }]])
+    params.cutaway = cutOverride !== null ? cutOverride : v.cut;
+    if (eighthFromUrl){ params.cutEighth = true; params.cutaway = true; }
+    gui.controllersRecursive().forEach(c=>c.updateDisplay()); rebuild(); }]])
   .then(() => {
     let frames = 0;
+    const autoPT = qs.get('pathTrace')==='1' || qs.get('pathTrace')==='true';
     renderer.setAnimationLoop(() => {
       controls.update();
-      renderer.render(scene, camera);
+      if (pt.enabled) tickPathTrace();
+      else renderer.render(scene, camera);
       labelRenderer.render(scene, camera);
-      if (++frames === 3) window.__ready = true;
+      if (++frames === 3){
+        window.__ready = true;
+        if (autoPT && !pt.enabled && !pt.building) startPathTrace();
+      }
     });
   });
 </script>
