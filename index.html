@@ -112,6 +112,7 @@ const G = {
   layerH: 1.0,      // water per pillow layer
   hookGap: 0.15,    // gap membrane -> top of first pillow (hook strap)
 };
+const PW = G.cell - 0.14, PH = G.layerH - 0.05;   // pillow outer dims (1.86 x 0.95 x 1.86 m) -> 0.14 m gap for tether lines
 function setHeight(H){   // edge arc keeps its angles, so the footprint grows with height
   G.H = H;
   G.rho = G.H / (Math.cos(G.arcTop) - Math.cos(G.arcGround));            // edge arc radius
@@ -182,13 +183,42 @@ function bandT(Tl){ // Tl: array of spectral transmittance -> weighted channel t
 }
 // path factor in water for incidence zenith angle θa (refraction at the film/water interface)
 const pathFactor = th => 1/Math.sqrt(1 - (Math.sin(th)/N_WATER)**2);
-function waterT(depth, sunElev){
-  const direct = bandT(A_WATER.map(a => Math.exp(-a*depth*pathFactor(Math.PI/2 - Math.max(sunElev, 0.01)))));
-  // isotropic sky: cosine-weighted hemisphere integral
-  const N=24, dif=new Array(WL.length).fill(0); let ws=0;
-  for (let k=0;k<N;k++){ const th=(k+0.5)/N*Math.PI/2, w=Math.cos(th)*Math.sin(th); ws+=w;
-    const pf=pathFactor(th); A_WATER.forEach((a,i)=>dif[i]+=w*Math.exp(-a*depth*pf)); }
-  const diffuse = bandT(dif.map(v=>v/ws));
+// ---- pillow shape -> water per cell and open (gap) area, used by mass, pressure, shielding and optics.
+// The drawn cushion (pillowGeometry) is a sphere pushed towards a rounded box, PW × PH × PW on a
+// G.cell × G.cell grid. The smooth shape it approximates has the vertical chord
+//   d(x,z) = PH · (1 − |2x/PW|^(2/0.28) − |2z/PW|^(2/0.28))^(0.55/2)
+// Integrated over one 2 × 2 m cell: water volume per pillow, covered (projected) area, open fraction
+// (14 cm streets between the columns + rounded corners), and a chord histogram for Beer–Lambert.
+const PILLOW = (() => {
+  const N = 400, A = G.cell*G.cell, dA = A/(N*N), NB = 24, w = new Array(NB).fill(0), wd = new Array(NB).fill(0);
+  let V = 0, Ap = 0;
+  for (let i=0;i<N;i++) for (let j=0;j<N;j++){
+    const x = -G.cell/2 + (i+0.5)*G.cell/N, z = -G.cell/2 + (j+0.5)*G.cell/N;
+    const s = Math.pow(Math.abs(2*x/PW), 2/0.28) + Math.pow(Math.abs(2*z/PW), 2/0.28);
+    if (s >= 1) continue;
+    const d = PH*Math.pow(1 - s, 0.55/2), b = Math.min(NB-1, Math.floor(d/PH*NB));
+    V += d*dA; Ap += dA; w[b] += dA; wd[b] += d*dA;
+  }
+  const chords = []; for (let b=0;b<NB;b++) if (w[b] > 0) chords.push({ d: wd[b]/w[b], w: w[b]/A });
+  return { V, Ap, A, open: 1 - Ap/A, depth: V/A, meanChord: V/Ap, chords };
+})();
+// One pillow layer as a screen: a ray either passes a gap (no water, no film) or crosses one pillow
+// (two film walls T_BAG + water chord d·pathFactor). Layers are treated as independent screens: an
+// oblique ray drifts L·tanθ sideways, so it does not stay inside the 14 cm streets; only an exactly
+// vertical ray would see the aligned gaps all the way down. Mean water path = PILLOW.depth per layer.
+function layerTl(pf){
+  return A_WATER.map(a => { let t = PILLOW.open; for (const c of PILLOW.chords) t += c.w*T_BAG*Math.exp(-a*c.d*pf); return t; });
+}
+const _difT = new Map();
+function waterT(L, sunElev){   // L pillow layers (films included, membrane not); band-integrated R,G,B,Y,PAR
+  const direct = bandT(layerTl(pathFactor(Math.PI/2 - Math.max(sunElev, 0.01))).map(t => Math.pow(t, L)));
+  let diffuse = _difT.get(L);   // isotropic sky: cosine-weighted hemisphere; depends on L only
+  if (!diffuse){
+    const N=24, dif=new Array(WL.length).fill(0); let ws=0;
+    for (let k=0;k<N;k++){ const th=(k+0.5)/N*Math.PI/2, wt=Math.cos(th)*Math.sin(th); ws+=wt;
+      layerTl(pathFactor(th)).forEach((t,i)=>dif[i]+=wt*Math.pow(t, L)); }
+    diffuse = bandT(dif.map(v=>v/ws)); _difT.set(L, diffuse);
+  }
   return { direct, diffuse };
 }
 
@@ -246,7 +276,9 @@ function dustTwoStreamDown(mu0, tau){
   return Math.max(0, downDif + S0*mu*eSun);
 }
 function irradiance(mu, tau){   // mu = sin(elevation)
-  if (mu <= 0) { const tw = S0*0.012*THREE.MathUtils.smoothstep(mu, -0.3, 0); return {dni:0, dir:0, dif:tw, glob:tw}; }
+  // twilight: fade out the two-stream sky at the clamped low-sun value, so it is continuous at the
+  // horizon and follows τ (a dusty sky is dark at sunset too; the old fixed 1.2 % of S₀ ignored τ)
+  if (mu <= 0) { const tw = dustTwoStreamDown(0.035, tau)*THREE.MathUtils.smoothstep(mu, -0.3, 0); return {dni:0, dir:0, dif:tw, glob:tw}; }
   const m = Math.max(mu, 0.035), tr = Math.exp(-tau/m);
   const dni = S0*tr, dir = dni*m;
   // Diffuse = two-stream global minus the unscattered beam. At τ ≤ 1 this stays
@@ -263,7 +295,7 @@ const PAR_PER_W = 2.06; // µmol photons PAR per J of broadband sunlight
 // ============================================================================
 const params = {
   height: 22.0, layers: 8, pillows: true, platform: true, tunnels: false, tunnelSpacing: 10, funnelCover: 100, perfOpen: 20, membrane: true, tethers: true, cutaway: true, cutEighth: false, labels: true,
-  time: 11.0, pathLights: 'auto', lat: 35, decl: 0, tau: 0.5, exposure: 1.0, view: 'overview', ledW: 0, ledHours: 16, ledAuto: true, ledMix620: 0.40,
+  time: 11.0, pathLights: 'auto', lat: 35.23, lon: 163.95, decl: 0, tau: 0.5, exposure: 1.0, view: 'overview', ledW: 0, ledHours: 16, ledAuto: true, ledMix620: 0.6,
 };
 const qs = new URLSearchParams(location.search);
 for (const [k,v] of qs) if (k in params) params[k] = (typeof params[k]==='number') ? parseFloat(v) : (typeof params[k]==='boolean' ? v==='1'||v==='true' : v);
@@ -293,6 +325,16 @@ controls.enableDamping = true;
 
 // shared uniforms for "light passed through water" on interior materials
 const TINT = { dir: { value: new THREE.Color(1,1,1) }, dif: { value: new THREE.Color(1,1,1) } };
+// Path-trace sky: butterscotch gradient (GradientEquirectTexture: lerp(bottom, top, (y/2+½)^exponent)),
+// scaled every light update so its horizontal irradiance (luminance) equals the model's diffuse sky on
+// the sun's scale (3.2 ≡ S0 W/m²). So it follows time and τ, and is dark at night.
+const PT_SKY = { top: [0.62, 0.42, 0.28], bottom: [0.86, 0.62, 0.40], exponent: 0.6 };
+const PT_SKY_EY = (() => { let e = 0; const N = 400;
+  for (let k=0;k<N;k++){ const mu = (k+0.5)/N, t = Math.pow((mu+1)/2, PT_SKY.exponent);
+    const c = [0,1,2].map(i => PT_SKY.bottom[i] + (PT_SKY.top[i]-PT_SKY.bottom[i])*t);
+    e += (0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2]) * mu / N; }
+  return 2*Math.PI*e; })();
+let ptEnvK = 1, ptHook = null;   // ptHook = path-trace light sync, set once the path tracer code is defined
 function interior(mat){
   mat.onBeforeCompile = sh => {
     sh.uniforms.uTintDir = TINT.dir; sh.uniforms.uTintDif = TINT.dif;
@@ -311,11 +353,14 @@ function interior(mat){
 const CUT_Z = 1.0;
 const cutPlane = new THREE.Plane(new THREE.Vector3(0,0,-1), CUT_Z);
 // 1/8 (45°) sector cutaway, a wedge about the −Z axis (the usual look-into side of the half cut).
-const EIGHTH_HALF = Math.PI/8, EIGHTH_CENTER = -Math.PI/2;
-const eighthPlanes = [new THREE.Plane(), new THREE.Plane()];
-{ const t1 = EIGHTH_CENTER - EIGHTH_HALF, t2 = EIGHTH_CENTER + EIGHTH_HALF;
-  eighthPlanes[0].setFromNormalAndCoplanarPoint(new THREE.Vector3(Math.sin(t1), 0, -Math.cos(t1)), new THREE.Vector3());
-  eighthPlanes[1].setFromNormalAndCoplanarPoint(new THREE.Vector3(-Math.sin(t2), 0, Math.cos(t2)), new THREE.Vector3()); }
+// three.js keeps fragments with n·p + c ≥ 0 for every plane. The wedge |atan2(x, −z)| ≤ π/8 is
+// −z ≥ |x|·cot(π/8), i.e. cos(π/8)·x − sin(π/8)·z ≥ 0 and −cos(π/8)·x − sin(π/8)·z ≥ 0
+// (same region as inEighth() and the path-trace slicer).
+const EIGHTH_HALF = Math.PI/8;
+const eighthPlanes = [
+  new THREE.Plane(new THREE.Vector3( Math.cos(EIGHTH_HALF), 0, -Math.sin(EIGHTH_HALF)), 0),
+  new THREE.Plane(new THREE.Vector3(-Math.cos(EIGHTH_HALF), 0, -Math.sin(EIGHTH_HALF)), 0),
+];
 function isCut(){ return !!(params.cutaway || params.cutEighth); }
 function inEighth(x, z){ return Math.abs(Math.atan2(x, -z)) <= EIGHTH_HALF + 1e-6; }
 function inCut(x, z){
@@ -339,25 +384,64 @@ scene.add(hemi);
 // Two-channel red grow LEDs just under the pillows (one mixed luminous ceiling over the plateau).
 // 620 nm: orange-red, closer to the eye's red / better colour rendering (high lm/W).
 // 660 nm: deep red, most efficient for photosynthesis (chlorophyll peak, higher wall-plug and µmol/J).
-// Default mix 40 % 620 / 60 % 660: most optical watts stay on the plant peak, but enough 620 that
-// auto-balance can restore the visual red share within 100 W/m² at typical 3–8 layer stacks, and
-// the interior looks less like a deep-red darkroom. Channel weights r,g,b are this model's linear
-// sRGB-band increments per optical W/m², scaled so 660 nm adds (1,0,0) as before; 620 nm adds
-// 5.23 to R per watt (ratio of the CMF→sRGB red values at the two wavelengths).
+// Default mix 60 % 620 / 40 % 660: 620 nm does the white balance (about 5× more visual red per watt,
+// close to the eye's red), 660 nm adds photosynthetic photons (chlorophyll peak, higher wall-plug and
+// µmol/J) so the LED share of the DLI does not vanish when auto-balance only needs a little red.
+//
+// UNITS. The solver works in "sun-equivalent watts" per colour channel: waterFilteredRGB() gives
+// R,G,B = (band transmittance) × I.glob, so unfiltered sunlight is (I, I, I) and 1 unit of R (G, B) is
+// the linear-sRGB red (green, blue) stimulus of 1 W/m² of BROADBAND 5778 K sunlight (all wavelengths;
+// only ~38 % of it lies in 400–700 nm). An LED watt is optical power at one wavelength, so its channel
+// weight is CMF→sRGB(λ) divided by the sun's stimulus per broadband watt (SUN_RGB_PER_W). Negative
+// sRGB components (620/660 nm lie outside the sRGB gamut) are clipped to 0, the same in the solver and
+// in the rendered light colour.
+const SUN_RGB_PER_W = (() => {
+  const T = 5778, c2 = 1.4388e-2, total = Math.pow(T/c2, 4)*Math.PI**4/15/1e-9;   // ∫ planck dλ (λ in nm), Stefan–Boltzmann
+  return { r: SUMW.r*10/total, g: SUMW.g*10/total, b: SUMW.b*10/total };          // SUMW sums 10 nm steps
+})();
+function ledChannel(nm){
+  const [x,y,z] = cmf(nm);
+  const r = 3.2406*x-1.5372*y-0.4986*z, g = -0.9689*x+1.8758*y+0.0415*z, b = 0.0557*x-0.2040*y+1.0570*z;
+  return { r: Math.max(0,r)/SUN_RGB_PER_W.r, g: Math.max(0,g)/SUN_RGB_PER_W.g, b: Math.max(0,b)/SUN_RGB_PER_W.b };
+}
 const LED_MAX = 100;
-const LED_TARGET_RED_SHARE = 1/3;
+const LED_TARGET_RED_SHARE = 1/3;   // sunlight's share in the R/G/B bars (reference only; auto targets Duv = 0)
+// ---- colorimetry for auto-balance: chromaticity, CCT and Duv (CIE 1960 uv distance to the Planckian locus)
+const WHITE_DUV_TOL = 0.006;        // ≈ ANSI C78.377 tolerance for "white" light
+function rgbToXYZ(r, g, b){ return [0.4124*r+0.3576*g+0.1805*b, 0.2126*r+0.7152*g+0.0722*b, 0.0193*r+0.1192*g+0.9505*b]; }
+function solverXYZ(rgb){            // solver channels (sun-equivalent W) -> absolute XYZ (CMF-weighted W)
+  return rgbToXYZ(rgb.r*SUN_RGB_PER_W.r, rgb.g*SUN_RGB_PER_W.g, rgb.b*SUN_RGB_PER_W.b); }
+function ledXYZPerW(){              // true CMF values of the line mix per optical W (not gamut-clipped)
+  const f = THREE.MathUtils.clamp(params.ledMix620 ?? 0.6, 0, 1), a = cmf(620), b = cmf(660);
+  return [0, 1, 2].map(i => f*a[i] + (1-f)*b[i]); }
+const uv60 = ([X,Y,Z]) => { const d = X + 15*Y + 3*Z; return d > 0 ? [4*X/d, 6*Y/d] : [0, 0]; };
+const PLANCK_UV = (() => { const out = [];
+  for (let T=1000; T<=40000; T*=1.004){ let X=0, Y=0, Z=0;
+    for (let l=380; l<=780; l+=5){ const lm=l*1e-9, p=1/(lm**5*(Math.exp(1.4388e-2/(lm*T))-1)), c=cmf(l); X+=p*c[0]; Y+=p*c[1]; Z+=p*c[2]; }
+    out.push([T, ...uv60([X,Y,Z])]); }
+  return out; })();
+function cctDuv(XYZ){               // nearest point on the Planckian locus; Duv > 0 above (green), < 0 below (pink)
+  const [u, v] = uv60(XYZ); let best = 0, bd = Infinity;
+  for (let i=0;i<PLANCK_UV.length;i++){ const d = (u-PLANCK_UV[i][1])**2 + (v-PLANCK_UV[i][2])**2; if (d < bd){ bd = d; best = i; } }
+  const [T, lu, lv] = PLANCK_UV[best];
+  return { CCT: T, Duv: Math.sign(v - lv || 1) * Math.sqrt(bd) };
+}
+function mixColour(rgb, W){         // filtered daylight + W optical W/m² of the current LED mix
+  const s = solverXYZ(rgb), e = ledXYZPerW();
+  return cctDuv([s[0] + W*e[0], s[1] + W*e[1], s[2] + W*e[2]]);
+}
 const LED_CH = {
-  620: { nm:620, umol:5.18, eta:0.38, lm:255, r:5.230, g:0, b:0, color: new THREE.Color(0xff5800) },
-  660: { nm:660, umol:5.52, eta:0.52, lm:44.5, r:1,     g:0, b:0, color: new THREE.Color(0xff0500) },
+  620: { nm:620, umol:5.18, eta:0.38, lm:255, ...ledChannel(620) },   // r ≈ 14.6 sun-W per optical W
+  660: { nm:660, umol:5.52, eta:0.52, lm:44.5, ...ledChannel(660) },  // r ≈ 2.8
 };
-function ledMix620(){ return THREE.MathUtils.clamp(params.ledMix620 ?? 0.40, 0, 1); }
+function ledMix620(){ return THREE.MathUtils.clamp(params.ledMix620 ?? 0.6, 0, 1); }
 function ledSplit(total){ const f=ledMix620(), t=Math.max(0,total); return { f, w620:t*f, w660:t*(1-f) }; }
 function ledAddPerWatt(){ const f=ledMix620(), a=LED_CH[620], b=LED_CH[660];
   return { r:f*a.r+(1-f)*b.r, g:f*a.g+(1-f)*b.g, b:f*a.b+(1-f)*b.b }; }
 function ledParPerWatt(){ const f=ledMix620(); return f*LED_CH[620].umol + (1-f)*LED_CH[660].umol; }
 function ledLuxOf(w620, w660){ return w620*LED_CH[620].lm + w660*LED_CH[660].lm; }
 function ledElecOf(w620, w660){ return w620/LED_CH[620].eta + w660/LED_CH[660].eta; }
-const ledLight = new THREE.RectAreaLight(0xff2a00, 0, 2*G.Rp, 2*G.Rp);
+const ledLight = new THREE.RectAreaLight(0xff0000, 0, 2*G.Rp, 2*G.Rp);
 ledLight.visible = false; scene.add(ledLight);
 function rectFormFactor(a, b, d){ // E/(πL) on the axis of a Lambertian 2a×2b rectangle at distance d
   d = Math.max(d, 0.05); const x=a/d, y=b/d, sx=Math.sqrt(1+x*x), sy=Math.sqrt(1+y*y);
@@ -368,22 +452,21 @@ function updateLedLight(){
   // RectAreaLight emits along local −Z; lookAt() would aim +Z, so rotate instead of lookAt.
   ledLight.position.set(0, y, 0);
   ledLight.rotation.set(-Math.PI/2, 0, 0);
-  const side = 2*(stats.canopyR || G.Rp); ledLight.width = side; ledLight.height = side;
+  // square with the same area as the LED canopy (so total emitted power = W/m² × canopy area)
+  const side = Math.sqrt(stats.canopyA || (2*G.Rp)**2); ledLight.width = side; ledLight.height = side;
   const F = rectFormFactor(side/2, side/2, y);
-  const { f, w620, w660 } = ledSplit(params.ledW);
-  const col = new THREE.Color(
-    f*LED_CH[620].color.r + (1-f)*LED_CH[660].color.r,
-    f*LED_CH[620].color.g + (1-f)*LED_CH[660].color.g,
-    f*LED_CH[620].color.b + (1-f)*LED_CH[660].color.b);
-  ledLight.color.copy(col);
-  // same radiometric scale as the sun: DirectionalLight intensity 3.2 ≡ S0 W/m² on a facing surface.
-  // RectAreaLight.intensity is nits; floor irradiance at the centre is π·L·F. Slider = W/m² at floor level.
-  const E = Math.max(0, params.ledW) * (3.2 / S0);
+  // Same scale as the sun: DirectionalLight intensity 3.2 ≡ S0 W/m² of broadband sunlight, i.e. render
+  // irradiance per channel = (solver sun-equivalent W) × 3.2/S0. The LEDs add W × a_c solver units per
+  // channel (a = ledAddPerWatt()), so the light colour is a/max(a) and the floor irradiance of its
+  // strongest channel is W × max(a) × 3.2/S0. RectAreaLight.intensity is luminance; E = π·L·F at the centre.
+  const a = ledAddPerWatt(), am = Math.max(a.r, a.g, a.b, 1e-9);
+  ledLight.color.setRGB(a.r/am, a.g/am, a.b/am);
+  const E = Math.max(0, params.ledW) * am * (3.2 / S0);
   ledLight.intensity = (params.ledW > 0 && F > 1e-6) ? E / (Math.PI * F) : 0;
   ledLight.visible = params.ledW > 0;
 }
 let cLedW = null;          // filled when the GUI is built
-let ledAutoState = { raw:0, applied:0, clamped:false, targetShare: LED_TARGET_RED_SHARE, outShare: LED_TARGET_RED_SHARE, inShare:0, mixShare:0, rgb:{r:0,g:0,b:0}, f:0.4, w620:0, w660:0 };
+let ledAutoState = { raw:0, applied:0, clamped:false, targetShare: LED_TARGET_RED_SHARE, outShare: LED_TARGET_RED_SHARE, inShare:0, mixShare:0, rgb:{r:0,g:0,b:0}, f:1.0, w620:0, w660:0 };
 function waterFilteredRGB(I, w, bag, tm, fracDir){
   const tT = params.tunnels ? (fracDir*(tm.kDir||0) + (1-fracDir)*(tm.kDif||0)) : 0;
   const keep = params.tunnels ? (tm.keep ?? 1) : 1;
@@ -391,11 +474,16 @@ function waterFilteredRGB(I, w, bag, tm, fracDir){
   return { r: ch('r'), g: ch('g'), b: ch('b') };
 }
 function ledWForWhiteBalance(rgb){           // 0 when there is no sunlight (night)
+  // Auto-balance target: Duv = 0, i.e. the mixed light lies on the Planckian (blackbody) locus.
+  // Water leaves the light above the locus (blue-green, Duv > 0); red LED light moves it down. Adding red
+  // cannot fix the green-vs-blue deficit, so "R share = 1/3" overshot into pink; Duv = 0 is the closest
+  // red-only light gets to white (a cool daylight white). Duv falls monotonically with W -> bisection.
   if (rgb.r + rgb.g + rgb.b <= 1e-9) return 0;
-  // Restore R/(R+G+B) = 1/3 after adding the current 620/660 mix: W = (G+B−2R) / (3 a_r − a_r−a_g−a_b)
-  const a = ledAddPerWatt(), den = 3*a.r - (a.r+a.g+a.b);
-  if (Math.abs(den) < 1e-9) return 0;
-  return (rgb.g + rgb.b - 2*rgb.r) / den;
+  if (mixColour(rgb, 0).Duv <= 0) return 0;               // already on the pink side without LEDs
+  let lo = 0, hi = LED_MAX;
+  while (mixColour(rgb, hi).Duv > 0){ lo = hi; hi *= 2; if (hi > 10*LED_MAX) return hi; }   // unreachable within the cap
+  for (let k=0;k<40;k++){ const m = (lo+hi)/2; if (mixColour(rgb, m).Duv > 0) lo = m; else hi = m; }
+  return (lo+hi)/2;
 }
 function computeLedAuto(I, w, bag, tm, fracDir){
   const rgb = waterFilteredRGB(I, w, bag, tm, fracDir);
@@ -407,7 +495,7 @@ function computeLedAuto(I, w, bag, tm, fracDir){
   return { rgb, raw, applied, clamped: raw > LED_MAX, targetShare: LED_TARGET_RED_SHARE,
     outShare: I.glob>0 ? LED_TARGET_RED_SHARE : 0,
     inShare: sum0>0 ? rgb.r/sum0 : 0,
-    mixShare: sum1>0 ? (rgb.r+addR)/sum1 : 0, f, w620, w660 };
+    mixShare: sum1>0 ? (rgb.r+addR)/sum1 : 0, f, w620, w660, sunCol: sum0>0 ? mixColour(rgb, 0) : null };
 }
 function dliLedAuto(){ // integrate the auto setpoint over one 24.66 h sol (same time grid as sunlight DLI)
   let s=0; const steps=96, L = params.pillows ? params.layers : 0, parW=ledParPerWatt();
@@ -467,7 +555,7 @@ function updateGround(){
   pos.needsUpdate = true; groundGeo.computeVertexNormals();
 }
 const rocks = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1, 0), new THREE.MeshStandardMaterial({ color:0x5a3020, roughness:1, flatShading:true }), 400);
-rocks.castShadow = rocks.receiveShadow = true; scene.add(rocks);
+rocks.castShadow = rocks.receiveShadow = true; rocks.frustumCulled = false; scene.add(rocks);   // instances move with the footprint; a cached bounding sphere would go stale
 function placeRocks(){
   const M = new THREE.Matrix4(), q = new THREE.Quaternion(); let n=0, seed=7;
   const rnd = ()=> (seed = (seed*16807)%2147483647)/2147483647;
@@ -581,13 +669,14 @@ const footings = new THREE.InstancedMesh(footGeo, footMat, MAX_ANCHORS);
 const collarGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.25, 16); collarGeo.translate(0, FOOT_H+0.12, 0);
 const collars = new THREE.InstancedMesh(collarGeo, interior(new THREE.MeshStandardMaterial({ color:0x444444, metalness:0.7, roughness:0.4 })), MAX_ANCHORS);
 footings.castShadow = footings.receiveShadow = collars.castShadow = true;
+footings.frustumCulled = collars.frustumCulled = false;   // see tethers below (stale bounding sphere)
 scene.add(footings, collars);
 // discreet uplights in the tether footings (one step dimmer than the path lights), warm white 2700 K
 // Real SpotLights are capped: every footing still gets an emissive lens, but dozens of lights would stall the frame at 50 m.
 const MAX_UPLIGHTS = 24;
 const upLensMat = new THREE.MeshStandardMaterial({ color:0x1a1a1a, emissive:0xffb46b, emissiveIntensity:0, roughness:0.4 });
 const upLensGeo = new THREE.RingGeometry(0.36, 0.5, 24).rotateX(-Math.PI/2); upLensGeo.translate(0, FOOT_H+0.005, 0);
-const upLenses = new THREE.InstancedMesh(upLensGeo, upLensMat, MAX_ANCHORS); scene.add(upLenses);
+const upLenses = new THREE.InstancedMesh(upLensGeo, upLensMat, MAX_ANCHORS); upLenses.frustumCulled = false; scene.add(upLenses);
 const upLights = [];
 for (let i=0;i<MAX_UPLIGHTS;i++){
   const sl = new THREE.SpotLight(0xffb46b, 0, 14, 0.62, 0.6, 2);
@@ -597,11 +686,13 @@ const tetherGeoHi = new THREE.CylinderGeometry(1, 1, 1, 6, 1); tetherGeoHi.trans
 const tetherGeoLo = new THREE.CylinderGeometry(1, 1, 1, 4, 1); tetherGeoLo.translate(0, 0.5, 0);
 const tetherMat = interior(new THREE.MeshStandardMaterial({ color:0xf2efe6, roughness:0.6 }));
 const tethers = new THREE.InstancedMesh(tetherGeoHi, tetherMat, MAX_TETHERS*2);
-tethers.castShadow = true; tethers.frustumCulled = true; scene.add(tethers);
+// Instance matrices / line vertices are rewritten on every rebuild; three r160 caches the bounding sphere once
+// and never invalidates it, so culling would pop tethers out at other heights. These meshes span the dome anyway.
+tethers.castShadow = true; tethers.frustumCulled = false; scene.add(tethers);
 const tetherLineGeo = new THREE.BufferGeometry();
 tetherLineGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_TETHERS*2*6), 3));
 const tetherLines = new THREE.LineSegments(tetherLineGeo, new THREE.LineBasicMaterial({ color:0xfff6e8, transparent:true, opacity:0.55 }));
-tetherLines.frustumCulled = true; scene.add(tetherLines);
+tetherLines.frustumCulled = false; scene.add(tetherLines);
 const TETHER_R = 0.0125;  // 2.5 cm Dyneema/steel rope (≈223 kN working load)
 
 // ---------------------------------------------------------------- water pillows
@@ -637,11 +728,12 @@ const pillowFilterMat = new THREE.MeshBasicMaterial({ color:0xffffff, blending:T
 const pillowFilter = new THREE.InstancedMesh(pillows.geometry, pillowFilterMat, MAX_CELLS*MAXL);
 pillowFilter.instanceMatrix = pillows.instanceMatrix; pillowFilter.renderOrder = 1; pillowFilter.frustumCulled = false;
 scene.add(pillowFilter);
-{ const t1 = bandT(A_WATER.map(a=>Math.exp(-a*G.layerH))); pillowFilterMat.color.setRGB(t1.r*T_BAG, t1.g*T_BAG, t1.b*T_BAG); }
+// per front-face hit: one pillow at its mean vertical chord (water volume / covered area) + its two film walls
+{ const t1 = bandT(A_WATER.map(a=>Math.exp(-a*PILLOW.meanChord))); pillowFilterMat.color.setRGB(t1.r*T_BAG, t1.g*T_BAG, t1.b*T_BAG); }
 const strapGeo = new THREE.CylinderGeometry(0.012, 0.012, 1, 5); strapGeo.translate(0, 0.5, 0);
 const straps = new THREE.InstancedMesh(strapGeo, new THREE.MeshStandardMaterial({ color:0x9a9a9a, metalness:0.5, roughness:0.4 }), MAX_CELLS);
 straps.frustumCulled = false; scene.add(straps);
-const PW = G.cell - 0.14, PH = G.layerH - 0.05;   // pillow outer dims (1.86 x 0.95 x 1.86 m) -> 0.14 m gap for tether lines
+// PW, PH (pillow outer dims) are defined with the geometry parameters at the top.
 
 // ---------------------------------------------------------------- scale objects: 1 house, 1 tree, 1 human
 const objs = new THREE.Group(); scene.add(objs);
@@ -707,7 +799,9 @@ const human = new THREE.Group(); objs.add(human);
 }
 
 // ---------------------------------------------------------------- light tunnels (instanced pipes/throats/diffusers + one funnel mesh)
-const tunnelMat = clippable(interior(new THREE.MeshStandardMaterial({ color:0xdde1e6, metalness:0.92, roughness:0.2, side:THREE.DoubleSide })));
+// No interior() tint on tunnels and funnels: the funnels sit above the water stack (only the outer
+// membrane above them) and the pipes run through the stack carrying unfiltered sunlight.
+const tunnelMat = clippable(new THREE.MeshStandardMaterial({ color:0xdde1e6, metalness:0.92, roughness:0.2, side:THREE.DoubleSide }));
 tunnelMat.envMap = sculptMat.envMap;
 const pipeGeo = new THREE.CylinderGeometry(PIPE_D/2, PIPE_D/2, 1, 28, 1, true); pipeGeo.translate(0, 0.5, 0);
 const pipes = new THREE.InstancedMesh(pipeGeo, tunnelMat, MAX_CELLS); pipes.frustumCulled = false; pipes.castShadow = true; scene.add(pipes);
@@ -720,8 +814,8 @@ function drawPerf(open){ const c = perfTex.image, g = c.getContext('2d'); g.fill
   perfTex.needsUpdate = true; }
 drawPerf(0.2);
 // perforated, see-through polished aluminium (holes = alpha cut-outs, ≈ perforation open %)
-const funnelMat = clippable(interior(new THREE.MeshStandardMaterial({ color:0xe8ebee, metalness:0.85, roughness:0.28, alphaMap:perfTex,
-  alphaTest:0.5, side:THREE.DoubleSide })));
+const funnelMat = clippable(new THREE.MeshStandardMaterial({ color:0xe8ebee, metalness:0.85, roughness:0.28, alphaMap:perfTex,
+  alphaTest:0.5, side:THREE.DoubleSide }));
 funnelMat.envMap = sculptMat.envMap;
 const funnel = new THREE.Mesh(new THREE.BufferGeometry(), funnelMat); funnel.frustumCulled = false; scene.add(funnel);
 function throatGeometry(half, r, h){ // square (2·half) at the top -> circle (r) at the bottom
@@ -1050,6 +1144,8 @@ function rebuildPlatform(waterBottom, cut){
   platHuman.name = 'platHuman';
   platHuman.position.set(PLATFORM_CX + 4.15, deckY, PLATFORM_CZ - 3.15);
   platHuman.rotation.y = 2.4; platformGroup.add(platHuman);
+  // its materials are not clippable (shared with the ground figure): hide it when the deck under it is cut away
+  platHuman.visible = !cut || inCut(platHuman.position.x, platHuman.position.z);
   // lights + fixtures
   for (const head of platformLampMeshes) head.position.set(PLATFORM_CX + head.userData.rx, deckY + PLATFORM_RAIL + 0.04, PLATFORM_CZ + head.userData.rz);
   for (const L of platformLights){
@@ -1142,7 +1238,7 @@ function rebuild(){
       }
       continue;
     }
-    pillowCount += Math.max(0,nl); water += Math.max(0,nl) * G.cell*G.cell*G.layerH;
+    pillowCount += Math.max(0,nl); water += Math.max(0,nl) * PILLOW.V;   // m³ = t
     if (cut && !inCut(c.x, c.z)) continue;
     if (nl > 0){
       setCyl(straps, nStrap++, new THREE.Vector3(c.x, top - 0.02, c.z), new THREE.Vector3(c.x, c.apex, c.z), 1);
@@ -1169,10 +1265,13 @@ function rebuild(){
   const lit = anchors.map((a,i)=>({a,r:Math.hypot(a.x,a.z)})).sort((p,q)=>p.r-q.r);
   let uLit = 0;
   for (const a of anchors){
-    if (cut && !inCut(a.x, a.z)) continue;
+    // In a cut, keep a tether when its attachment point is on the kept side (same rule as the pillow
+    // cells it sits between); a footing is shown when it is on the kept side or carries a kept tether.
+    const pts = cut ? a.pts.filter(([x,z]) => params.cutEighth ? inEighth(x, z) : z < CUT_Z) : a.pts;   // half cut: the z = 1 row lies on the section plane and belongs to the far bundles
+    if (cut && !inCut(a.x, a.z) && !(params.tethers && pts.length)) continue;
     M4.makeTranslation(a.x, 0, a.z); footings.setMatrixAt(nf, M4); collars.setMatrixAt(nf, M4); upLenses.setMatrixAt(nf, M4); nf++;
     if (!params.tethers) continue;
-    for (const [x,z] of a.pts){
+    for (const [x,z] of pts){
       const attY = baseHeight(Math.hypot(x,z));
       const localTop = attY - G.hookGap;
       const nlLoc = Math.min(L, Math.max(0, Math.floor((localTop - 0.3)/G.layerH)));
@@ -1271,9 +1370,8 @@ function setInfoMode(mode){
   updateLight();
 }
 function interiorTransmission(L, elev){
-  const depth = L*G.layerH, bag = Math.pow(T_BAG, L) * T_MEMBRANE;
-  const w = waterT(depth, elev);
-  return { w, bag };
+  // w: pillow stack (water + bag films + open gaps, see PILLOW / layerTl); bag: outer membrane only
+  return { w: waterT(L, elev), bag: T_MEMBRANE };
 }
 // light-tunnel optics, per unit roof area and per unit outside irradiance (before the outer membrane):
 //  • water-filtered share: open roof + perforations of the funnel sheet (pipe cells hold no water)
@@ -1303,6 +1401,13 @@ function dli(L, outside, naive=false){
     s += par * (88775/steps); }
   return s/1e6;
 }
+const _solCache = new Map();
+function cachedSol(key, fn){
+  if (_solCache.has(key)) return _solCache.get(key);
+  if (_solCache.size > 256) _solCache.clear();
+  const v = fn(); _solCache.set(key, v); return v;
+}
+let _lastInfoHTML = '';
 let _perf = -1; function drawPerfIfChanged(){ if (_perf !== params.perfOpen){ _perf = params.perfOpen; drawPerf(params.perfOpen/100); } }
 function updateLight(){
   const L = stats.L ?? params.layers;
@@ -1330,10 +1435,13 @@ function updateLight(){
   // unfiltered (spectrally flat Al) through the pipe and leaves the diffuser as diffuse light
   const tm = tunnelModel(L, elev);
   TINT.dir.value.setRGB(tm.keep*w.direct.r*bag, tm.keep*w.direct.g*bag, tm.keep*w.direct.b*bag);
-  const hc = hemi.color, tdir = I.dif > 1e-6 ? tm.kDir*I.dir/I.dif : 0, tdif = tm.kDif;
-  TINT.dif.value.setRGB(tm.keep*w.diffuse.r*bag + tdir*sunCol.r/hc.r + tdif,
-                        tm.keep*w.diffuse.g*bag + tdir*sunCol.g/hc.g + tdif,
-                        tm.keep*w.diffuse.b*bag + tdir*sunCol.b/hc.b + tdif);
+  // Interior diffuse on the same radiometric scale as the sun and the LEDs (3.2 ≡ S0 W/m²), per channel
+  // exactly what the solver counts as diffuse inside. The hemisphere light's intensity and butterscotch
+  // colour are tuned for the outside look, so they are divided out here. Tunnel light leaves the
+  // diffusers as diffuse, spectrally flat light.
+  const hc = hemi.color, hI = Math.max(hemi.intensity, 1e-6), tunDif = tm.kDir*I.dir + tm.kDif*I.dif;
+  const difC = c => (tm.keep*w.diffuse[c]*bag*I.dif + tunDif) * (3.2/S0) / (hI*Math.max(hc[c], 1e-3));
+  TINT.dif.value.setRGB(difC('r'), difC('g'), difC('b'));
   // diffuser luminance relative to the outside sky: delivered tunnel flux / diffuser (= mouth) area
   const tunExit = I.glob > 0 && tm.fM > 0 ? (tm.kDir*I.dir + tm.kDif*I.dif)/(tm.fM*I.glob) : 0;
   diffMat.emissiveIntensity = Math.min(4, THREE.MathUtils.clamp(I.glob/450, 0, 1) * tunExit * 0.6);
@@ -1361,15 +1469,20 @@ function updateLight(){
     cLedW?.enable();
   }
   updateLedLight();
+  ptEnvK = (3.2*I.dif/S0) / PT_SKY_EY;
+  if (ptHook) ptHook();
 
   // numbers
   const luxOut = I.glob*LUM_EFF, parOut = I.glob*PAR_PER_W;
   const tY = (fracDir*w.direct.Y + (1-fracDir)*w.diffuse.Y)*bag, tPAR = (fracDir*w.direct.par + (1-fracDir)*w.diffuse.par)*bag;
-  const waterKPa = L*G.layerH*P.rho*P.g/1000, dp = P.pin - P.pout, net = dp - waterKPa;
+  const waterKPa = L*PILLOW.depth*P.rho*P.g/1000, dp = P.pin - P.pout, net = dp - waterKPa;   // weight per roof area: pillow volume / cell area
   const perTether = net*G.cell*G.cell, perBundle = perTether*25;
   const hh = Math.floor(params.time), mm = Math.floor((params.time-hh)*60);
   const bar = (v,c)=>`<span class="bar" style="width:${Math.round(v*90)}px;background:${c}"></span>`;
-  const dOut = dli(L,true), dIn = dli(L,false);
+  // Sol integrals do not depend on the time of day or exposure: cache them so scrubbing / ▶ animate is cheap.
+  const solKey = [L, params.lat, params.decl, params.tau, params.tunnels, params.perfOpen, stats.fF, stats.fP, stats.fM, stats.pipeLen].join('|');
+  const dOut = cachedSol('out|'+[params.lat, params.decl, params.tau].join('|'), () => dli(L,true));
+  const dIn = cachedSol('in|'+solKey, () => dli(L,false));
   let tunHTML = '';
   if (params.tunnels){
     const tN = tunnelModel(L, elev, true);
@@ -1399,7 +1512,8 @@ function updateLight(){
     </table><div class="src">Model (area-weighted): interior = [open roof + perforations]·water-filtered + mouth·T<sub>pipe</sub>(θ) + funnel sheet·(1−open)·ρ<sub>f</sub>·accepted·T<sub>pipe,diffuse</sub>, × 0.95 diffuser × T<sub>membrane</sub>; all tunnel light leaves the diffuser as diffuse light. A static funnel cannot raise radiance (étendue): it accepts only directions within θ<sub>a</sub> = asin(1/√C), and for sky light it delivers at most mouth area × sky. That bound needs an ideal compound parabolic concentrator ≈ ${fmt(cpcLen,0)} m deep; the drawn ${fmt(stats.dep,1)} m funnel (15° walls) sends near-vertical sun back up and does worse. The naive row assumes every captured ray reaches the pipe. T<sub>pipe</sub> = ρ<sup>n</sup>, n = L·tanθ/D; Al spectrally flat.</div>`;
   }
   const marsCol = P.pout*1000/P.g/10, earthCol = P.atm*1000/9.80665/10;   // g/cm²
-  const sh = { marsCol, earthCol, total: L*100 + marsCol };
+  const waterCol = L*PILLOW.depth*100;   // mean areal density, g/cm² (1 m of water = 100 g/cm²)
+  const sh = { marsCol, earthCol, total: waterCol + marsCol };
   sh.alt = isaAltitude(sh.total/earthCol); sh.altMars = isaAltitude(marsCol/earthCol);
   const parIn = (params.tunnels ? (tm.keep*tPAR + (fracDir*tm.kDir + (1-fracDir)*tm.kDif)) : tPAR) * parOut;
   const luxIn = (params.tunnels ? (tm.keep*tY + (fracDir*tm.kDir + (1-fracDir)*tm.kDif)) : tY) * luxOut;
@@ -1408,17 +1522,20 @@ function updateLight(){
   const ledPar620 = w620*LED_CH[620].umol, ledPar660 = w660*LED_CH[660].umol, ledPar = ledPar620 + ledPar660;
   const ledLux620 = w620*LED_CH[620].lm, ledLux660 = w660*LED_CH[660].lm, ledLux = ledLux620 + ledLux660;
   const elec620 = w620/LED_CH[620].eta, elec660 = w660/LED_CH[660].eta, elecWm2 = elec620 + elec660;
-  const ledDLI = params.ledAuto ? dliLedAuto() : ledPar * params.ledHours * 3600 / 1e6;
+  const ledDLI = params.ledAuto ? cachedSol('led|'+solKey+'|'+ledMix620()+'|'+params.pillows, dliLedAuto) : ledPar * params.ledHours * 3600 / 1e6;
   const canopyA = stats.canopyA ?? (cells.length*G.cell*G.cell);
   const footprintA = Math.PI * G.R * G.R;
   const sunR = ledAutoState.rgb.r, sunG = ledAutoState.rgb.g, sunB = ledAutoState.rgb.b;
   const sunSum = sunR+sunG+sunB, addR = add.r*params.ledW, addG = add.g*params.ledW, addB = add.b*params.ledW;
   const mixSum = sunSum + addR + addG + addB;
   const redSun = sunSum>0 ? sunR/sunSum : 0, redMix = mixSum>0 ? (sunR+addR)/mixSum : redSun;
+  const colSun = sunSum>0 ? mixColour(ledAutoState.rgb, 0) : null, colMix = sunSum>0 || params.ledW>0 ? mixColour(ledAutoState.rgb, params.ledW) : null;
+  const cdStr = c => c ? `${fmt(Math.round(c.CCT/10)*10,0)} K / ${c.Duv>=0?'+':'−'}${fmt(Math.abs(c.Duv),4)}` : '–';
   const parShare = (parIn+ledPar)>0 ? 100*ledPar/(parIn+ledPar) : 0;
   const autoNeed = ledAutoState.raw, autoClamp = params.ledAuto && ledAutoState.clamped;
   const ledHTML = `<h2>Red grow LEDs (620 + 660 nm), under the pillows</h2><table>
-     <tr><td>Optical irradiance at floor (total)</td><td class="v">${fmt(params.ledW,0)} W/m²</td></tr>
+     <tr><td>Optical irradiance at floor (total)</td><td class="v">${fmt(params.ledW,1)} W/m²</td></tr>
+     <tr><td>Red stimulus per optical W, 620 / 660 nm (sun-equivalent W)</td><td class="v">${fmt(LED_CH[620].r,1)} / ${fmt(LED_CH[660].r,2)}</td></tr>
      <tr><td>620 / 660 mix (fraction 620 nm)</td><td class="v">${fmt(100*mixF,0)} % / ${fmt(100*(1-mixF),0)} %</td></tr>
      <tr><td>620 nm optical / PAR / illuminance</td><td class="v">${fmt(w620,0)} W/m² / ${fmt(ledPar620)} µmol/m²/s / ${fmt(ledLux620)} lx</td></tr>
      <tr><td>660 nm optical / PAR / illuminance</td><td class="v">${fmt(w660,0)} W/m² / ${fmt(ledPar660)} µmol/m²/s / ${fmt(ledLux660)} lx</td></tr>
@@ -1427,18 +1544,19 @@ function updateLight(){
      <tr><td>Electrical, 660 nm (52 % WPE)</td><td class="v">${fmt(elec660,0)} W/m²</td></tr>
      <tr><td>LEDs span the underside of the pillow canopy</td><td class="v">${fmt(canopyA,0)} m² (footprint ${fmt(footprintA,0)} m²)</td></tr>
      <tr><td>Electrical total / pillow canopy</td><td class="v">${fmt(elecWm2,0)} W/m² / ${fmt(elecWm2*canopyA/1000,0)} kW over ${fmt(canopyA,0)} m²</td></tr>
-     <tr><td>Auto-balance (Earth-like white)</td><td class="v">${params.ledAuto ? 'on' : 'off'}</td></tr>
-     <tr><td>White-balance metric</td><td class="v">R/(R+G+B) → ${fmt(100*LED_TARGET_RED_SHARE,1)} %</td></tr>
+     <tr><td>Auto-balance (white, Duv = 0)</td><td class="v">${params.ledAuto ? 'on' : 'off'}</td></tr>
+     <tr><td>White-balance target</td><td class="v">Duv → 0 (on the blackbody locus)</td></tr>
+     <tr><td>Colour sun only → with LEDs (CCT / Duv)</td><td class="v">${cdStr(colSun)} → ${cdStr(colMix)}</td></tr>
      <tr><td>Red share outside → sun only → with LEDs</td><td class="v">${fmt(100*ledAutoState.outShare,0)} % → ${fmt(100*redSun,0)} % → ${fmt(100*redMix,0)} %</td></tr>
      <tr><td>LED setpoint for target (unclamped)</td><td class="v">${fmt(Math.max(0,autoNeed),0)} W/m²</td></tr>
-     ${autoClamp ? `<tr><td colspan="2" style="color:#ff8a6a">⚠ 100 W/m² is not enough to reach the ${fmt(100*LED_TARGET_RED_SHARE,0)} % red-share target (need ${fmt(autoNeed,0)} W/m² at the current mix). Slider is clamped at 100.</td></tr>` : ''}
+     ${autoClamp ? `<tr><td colspan="2" style="color:#ff8a6a">⚠ 100 W/m² is not enough to reach Duv = 0 at the current mix (need ${autoNeed > 10*LED_MAX ? 'more than '+fmt(10*LED_MAX,0) : fmt(autoNeed,0)} W/m²). Slider is clamped at 100.</td></tr>` : ''}
      <tr><td>PAR sunlight (this hour) + LEDs</td><td class="v">${fmt(parIn)} + ${fmt(ledPar)} = ${fmt(parIn+ledPar)} µmol/m²/s</td></tr>
      <tr><td>LED share of PAR (this hour)</td><td class="v">${fmt(parShare,0)} %</td></tr>
      <tr><td>Photoperiod</td><td class="v">${params.ledAuto ? 'follows the sun (off at night)' : fmt(params.ledHours,1)+' h/sol'}</td></tr>
      <tr><td>DLI from LEDs</td><td class="v">${fmt(ledDLI,1)} mol/m²/sol</td></tr>
      <tr><td>DLI sun + LEDs (1 sol)</td><td class="v">${fmt(dIn,1)} + ${fmt(ledDLI,1)} = ${fmt(dIn+ledDLI,1)} mol/m²</td></tr>
     </table>
-    <div class="src">Two-channel luminous ceiling just under the pillow stack. LEDs span the underside of the pillow canopy (${fmt(canopyA,0)} m²), which is the grid of pillow cells — less than the dome footprint (${fmt(footprintA,0)} m²) because the edge arc has no pillows where the membrane is too low. The top slider is total optical W/m² at floor level (area-light intensity is compensated for ceiling height). The mix slider is the fraction of those watts at 620 nm (the rest is 660 nm); default 40 % / 60 %. 620 nm is orange-red: closer to the eye’s red, much higher luminous efficacy (this model’s CIE 1931 ȳ(620 nm)×683 = 255 lm/W; CIE V(620) ≈ 0.381 → 260 lm/W) and about 5.2× more effective per watt in the model’s sRGB red band, so it does the work of visual white balance and colour rendering. 660 nm is deep red: closest to the chlorophyll absorption peak, slightly more photons per joule (5.52 vs 5.18 µmol/J) and a higher wall-plug efficiency. Auto-balance (Earth-like white): unfiltered sunlight is (1,1,1) in the R/G/B bands, so its red share is 1/3. The unique total W that restores that share at the current mix is used, then clamped to 0–100 W/m²; with no sunlight the formula gives 0, so the LEDs switch off at night. The mix slider stays user-set during auto (it is a design choice, not a power level). Photoperiod: default 16 h/sol (hours × 3600 s) when auto is off; when auto is on, DLI integrates the auto setpoint over one 24.66 h sol (same time grid as the sunlight DLI) and the hours slider is unused. Wall-plug assumptions: 38 % at 620 nm (mid of the 35–40 % range for orange-red diodes plus driver) and 52 % at 660 nm (mid of 50–55 %).</div>`;
+    <div class="src">Two-channel luminous ceiling just under the pillow stack. LEDs span the underside of the pillow canopy (${fmt(canopyA,0)} m²), which is the grid of pillow cells — less than the dome footprint (${fmt(footprintA,0)} m²) because the edge arc has no pillows where the membrane is too low. The top slider is total optical W/m² at floor level (area-light intensity is compensated for ceiling height). The mix slider is the fraction of those watts at 620 nm (the rest is 660 nm); default 60 % 620 nm / 40 % 660 nm: 620 nm does the white balance, 660 nm adds photosynthetic photons so the LED share of the DLI does not vanish when only a little red is needed. 620 nm is orange-red: closer to the eye’s red, much higher luminous efficacy (this model’s CIE 1931 ȳ(620 nm)×683 = 255 lm/W; CIE V(620) ≈ 0.381 → 260 lm/W) and about 5.2× more effective per watt in the sRGB red channel, so it does the work of visual white balance and colour rendering. 660 nm is deep red: closest to the chlorophyll absorption peak, slightly more photons per joule (5.52 vs 5.18 µmol/J) and a higher wall-plug efficiency. Units: the colour solver counts each linear-sRGB channel in sun-equivalent watts, 1 unit = the R (G, B) stimulus of 1 W/m² of broadband 5778 K sunlight (all wavelengths; only ~38 % of it is in 400–700 nm). Unfiltered sunlight of I W/m² is therefore (I, I, I) and has red share 1/3. One optical W/m² of LED light at λ adds CMF→sRGB(λ) ÷ (the sun’s stimulus per broadband W): R = ${fmt(LED_CH[620].r,1)} at 620 nm and ${fmt(LED_CH[660].r,2)} at 660 nm (its small negative G/B, outside the sRGB gamut, is clipped to 0). The rendered LED light uses the same numbers: colour = that R:G:B, floor irradiance = W × R × 3.2/S₀ on the sun’s render scale (3.2 ≡ S₀ W/m²), and the interior sky light is put on the same scale, so the 3D view shows the colour the panel reports. Auto-balance (white, Duv = 0): solver channels × the sun’s per-W stimulus → absolute linear sRGB → CIE XYZ, plus the LED lines’ own CIE 1931 XYZ per W; CCT and Duv are the nearest point on the Planckian (blackbody) locus in CIE 1960 uv. Water leaves the light above the locus (blue-green, Duv > 0) and red moves it down; the W at which Duv = 0 is found by bisection and clamped to 0–100 W/m² (0 if the light is already on the pink side, and with no sunlight, so the LEDs switch off at night). Red light cannot replace the green that the water removes, so this white is a cool daylight white (high CCT), not sunlight’s ~5800 K; the older target “R/(R+G+B) = 1/3” overshot into a visible pink (Duv ≈ −0.017). Label: “white (CCT)” when |Duv| < ${WHITE_DUV_TOL} (≈ ANSI C78.377 tolerance), otherwise pink or blue-green tint. The R/G/B bars are the floor light’s channel shares relative to sunlight (sunlight = 33/33/33), not a white criterion. The mix slider stays user-set during auto (it is a design choice, not a power level). Photoperiod: default 16 h/sol (hours × 3600 s) when auto is off; when auto is on, DLI integrates the auto setpoint over one 24.66 h sol (same time grid as the sunlight DLI) and the hours slider is unused. Wall-plug assumptions: 38 % at 620 nm (mid of the 35–40 % range for orange-red diodes plus driver) and 52 % at 660 nm (mid of 50–55 %).</div>`;
     const fullHTML = `
   <h1>MARSOUPILAMI</h1>
   <div class="sub">Martian Overpressure Utility Pillow &amp; Laminated Membrane Infrastructure — tethered membrane dome (after Casey Handmer) with water pillows hung inside the membrane.</div>
@@ -1446,55 +1564,56 @@ function updateLight(){
    <tr><td>Footprint Ø / tethered flat plateau Ø</td><td class="v">${fmt(2*G.R)} m / ${fmt(2*G.Rp)} m</td></tr>
    <tr><td>Membrane height at tether points / pillow crest</td><td class="v">${fmt(G.H,1)} m / ${fmt(G.H+G.bulge,2)} m</td></tr>
    <tr><td>Edge arc (60° at ground, 15° at plateau), radius</td><td class="v">${fmt(G.rho,1)} m</td></tr>
-   <tr><td>Enclosed volume / air mass at 0.85 atm</td><td class="v">${fmt(stats.volume/1000,0)}k m³ / ${fmt(stats.volume*1.025/1000,0)} t</td></tr>
+   <tr><td>Enclosed volume / air mass at 0.85 atm (net of water)</td><td class="v">${fmt(stats.volume/1000,0)}k m³ / ${fmt(Math.max(0, stats.volume - (stats.water||0))*1.025/1000,0)} t</td></tr>
    <tr><td>Anchor spacing / tethers per bundle</td><td class="v">${fmt(G.anchor)} m / ≤25</td></tr>
    <tr><td>Anchors / tethers total</td><td class="v">${anchors.length} / ${stats.nTethers ?? tetherCount()}</td></tr>
    <tr><td>Attachment grid = pillow cell</td><td class="v">${G.cell} × ${G.cell} m</td></tr>
-   <tr><td>Pillow layers × thickness</td><td class="v">${L} × ${G.layerH} m</td></tr>
+   <tr><td>Pillow layers × pitch</td><td class="v">${L} × ${G.layerH} m</td></tr>
+   <tr><td>Pillow ${fmt(PW,2)} × ${fmt(PH,2)} × ${fmt(PW,2)} m: water / open area per cell</td><td class="v">${fmt(PILLOW.V,2)} m³ (${fmt(100*PILLOW.depth,0)} % of a 1 m slab) / ${fmt(100*PILLOW.open,1)} %</td></tr>
    <tr><td>Clear height under water (plateau)</td><td class="v">${stats.waterBottom>0.3 ? fmt(stats.waterBottom,1)+' m' : '<span style="color:#ff8a6a">none</span>'}</td></tr>
    ${platformGroup.visible ? `<tr><td>Suspended platform Ø / walking surface</td><td class="v">${fmt(2*PLATFORM_R,0)} m / ${fmt(platformGroup.userData.deckY,1)} m</td></tr>` : ''}
    ${platformGroup.visible ? `<tr><td>Platform pool (${fmt(PLATFORM_POOL_W,2)} × ${fmt(PLATFORM_POOL_L,2)} × ${fmt(PLATFORM_POOL_D,2)} m water)</td><td class="v">${fmt(platformGroup.userData.poolKg||0,0)} kg water + ${fmt(platformGroup.userData.poolBasinKg||0,0)} kg basin</td></tr>` : ''}
    <tr><td>Pillows rendered / water</td><td class="v">${fmt(stats.pillowCount)} / ${fmt(stats.water)} t</td></tr>
-   <tr><td>Nominal water (${L} m over all cells)</td><td class="v">${fmt(cells.length*G.cell*G.cell*L)} t</td></tr>
-   ${L>stats.maxFit ? `<tr><td colspan="2" style="color:#ff8a6a">⚠ ${L} m of water does not fit under a ${G.H} m dome: rendered stacks are clamped at the ground (max ${stats.maxFit} layers). Pressure, shielding and light figures use the nominal ${L} m.</td></tr>` : ''}
+   <tr><td>Nominal water (${L} layers over all cells)</td><td class="v">${fmt(cells.length*PILLOW.V*L)} t</td></tr>
+   ${L>stats.maxFit ? `<tr><td colspan="2" style="color:#ff8a6a">⚠ ${L} m of water does not fit under a ${G.H} m dome: rendered stacks are clamped at the ground (max ${stats.maxFit} layers). Pressure, shielding and light figures use the nominal ${L} layers.</td></tr>` : ''}
   </table>
   <h2>Pressure balance</h2><table>
    <tr><td>Inside 0.85 atm − outside (~0.6 kPa)</td><td class="v">${fmt(dp,1)} kPa</td></tr>
-   <tr><td>Water load ${L} m × 1000 kg/m³ × 3.711 m/s²</td><td class="v">${fmt(waterKPa,1)} kPa (${fmt(100*waterKPa/dp,1)} %)</td></tr>
+   <tr><td>Water load ${L} × ${fmt(PILLOW.depth,3)} m × 1000 kg/m³ × 3.711 m/s²</td><td class="v">${fmt(waterKPa,1)} kPa (${fmt(100*waterKPa/dp,1)} %)</td></tr>
    <tr><td>Net uplift carried by tethers</td><td class="v">${fmt(net,1)} kPa</td></tr>
    <tr><td>Load per tether (4 m²) / per bundle (100 m²)</td><td class="v">${fmt(perTether,0)} kN / ${fmt(perBundle/1000,1)} MN</td></tr>
    <tr><td>Equivalent ballast per anchor (Mars g)</td><td class="v">${fmt(perBundle*1000/P.g/1000,0)} t</td></tr>
-   <tr><td>Water depth for full balance</td><td class="v">${fmt(dp*1000/(P.rho*P.g),1)} m</td></tr>
+   <tr><td>Water for full balance (solid depth / pillow layers)</td><td class="v">${fmt(dp*1000/(P.rho*P.g),1)} m / ${fmt(dp*1000/(P.rho*P.g)/PILLOW.depth,1)}</td></tr>
   </table>
   <h2>Shielding vs. Earth</h2><table>
-   <tr><td>Water ${L} m</td><td class="v">${fmt(L*100)} g/cm²</td></tr>
+   <tr><td>Water ${L} layers (mean ${fmt(L*PILLOW.depth,2)} m solid)</td><td class="v">${fmt(waterCol)} g/cm²</td></tr>
    <tr><td>+ Mars atmosphere column (${fmt(P.pout*1000,0)} Pa / g<sub>Mars</sub>)</td><td class="v">${fmt(sh.marsCol,1)} g/cm²</td></tr>
    <tr><td><b>Total overhead mass</b></td><td class="v"><b>${fmt(sh.total,0)} g/cm²</b></td></tr>
    <tr><td>Earth sea-level atmosphere column</td><td class="v">${fmt(sh.earthCol,0)} g/cm²</td></tr>
    <tr><td><b>= share of Earth sea level</b></td><td class="v"><b>${fmt(100*sh.total/sh.earthCol,1)} %</b></td></tr>
    <tr><td><b>≈ like standing on Earth at</b></td><td class="v"><b>${sh.total>=sh.earthCol ? 'sea level or deeper (×'+fmt(sh.total/sh.earthCol,2)+')' : (sh.alt>47?'> 47 km':fmt(sh.alt,1)+' km')}</b></td></tr>
    <tr><td>(bare Mars surface, for reference)</td><td class="v">${fmt(sh.altMars,1)} km</td></tr>
-   <tr><td>Water depth for Earth sea-level column</td><td class="v">${fmt((sh.earthCol-sh.marsCol)/100,1)} m</td></tr>
+   <tr><td>Water for Earth sea-level column (solid depth / pillow layers)</td><td class="v">${fmt((sh.earthCol-sh.marsCol)/100,1)} m / ${fmt((sh.earthCol-sh.marsCol)/100/PILLOW.depth,1)}</td></tr>
    <tr><td>Rough dose refs: Mars surface (RAD)</td><td class="v">~230 mSv/yr</td></tr>
    <tr><td>Earth natural background (world avg.)</td><td class="v">~2.4 mSv/yr</td></tr>
   </table>
-  <div class="src">Equivalent altitude: hydrostatic column ∝ pressure, so overhead mass / 1033 g/cm² = p/p₀, inverted with the ICAO/US 1976 standard atmosphere (0–47 km). Compares mass only: Earth also has a magnetosphere, and GCR dose does not scale linearly with mass (secondary particles), so no dose is computed for the water. Dose refs: Hassler et al. 2014, Science 343 (Curiosity RAD, 0.64 mSv/day ≈ 230 mSv/yr); UNSCEAR 2008 (2.4 mSv/yr).</div>
-  <h2>Light — LTST ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}, ${params.lat}°N, δ=${params.decl}°</h2><table>
+  <div class="src">Equivalent altitude: hydrostatic column ∝ pressure, so overhead mass / 1033 g/cm² = p/p₀, inverted with the ICAO/US 1976 standard atmosphere (0–47 km). Water column is the mean over the roof (pillow volume / cell area); a sightline exactly along a 14 cm street sees less, any oblique one crosses pillows. Compares mass only: Earth also has a magnetosphere, and GCR dose does not scale linearly with mass (secondary particles), so no dose is computed for the water. Dose refs: Hassler et al. 2014, Science 343 (Curiosity RAD, 0.64 mSv/day ≈ 230 mSv/yr); UNSCEAR 2008 (2.4 mSv/yr).</div>
+  <h2>Light — LTST ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}, ${Math.abs(params.lat)}°${params.lat < 0 ? 'S' : 'N'} ${params.lon}°E, δ=${params.decl}°</h2><table>
    <tr><td>Sun elevation / azimuth</td><td class="v">${fmt(elev*180/Math.PI,1)}° / ${fmt(az,0)}°</td></tr>
    <tr><td>Outside global horiz. (τ=${params.tau})</td><td class="v">${fmt(I.glob)} W/m² (${fmt(100*I.glob/1000)} % of Earth 1000)</td></tr>
-   <tr><td>Water transmission, direct sun (${fmt(L*G.layerH*pathFactor(Math.PI/2-Math.max(elev,0.01)),2)} m path)</td><td class="v"></td></tr>
+   <tr><td>Pillow stack transmission, direct sun (mean water path ${fmt(L*PILLOW.depth*pathFactor(Math.PI/2-Math.max(elev,0.01)),2)} m)</td><td class="v"></td></tr>
    <tr><td>&nbsp; R ${bar(w.direct.r,'#e04040')}</td><td class="v">${fmt(100*w.direct.r,1)} %</td></tr>
    <tr><td>&nbsp; G ${bar(w.direct.g,'#40c040')}</td><td class="v">${fmt(100*w.direct.g,1)} %</td></tr>
    <tr><td>&nbsp; B ${bar(w.direct.b,'#4070ff')}</td><td class="v">${fmt(100*w.direct.b,1)} %</td></tr>
    <tr><td>Diffuse sky light R / G / B</td><td class="v">${fmt(100*w.diffuse.r,0)} / ${fmt(100*w.diffuse.g,0)} / ${fmt(100*w.diffuse.b,0)} %</td></tr>
-   <tr><td>+ membrane ${T_MEMBRANE} × bags ${T_BAG}<sup>${L}</sup></td><td class="v">× ${fmt(bag,3)}</td></tr>
+   <tr><td>+ outer membrane (bag films ${T_BAG} per pillow are in the stack values)</td><td class="v">× ${fmt(bag,3)}</td></tr>
    <tr><td>Illuminance outside → inside</td><td class="v">${fmt(luxOut/1000,1)} → ${fmt(luxOut*tY/1000,1)} klx (${fmt(100*tY)} %)</td></tr>
    <tr><td>PAR outside → inside</td><td class="v">${fmt(parOut)} → ${fmt(parOut*tPAR)} µmol/m²/s (${fmt(100*tPAR)} %)</td></tr>
    <tr><td>Daily light integral out → in (1 sol)${params.tunnels?' (with tunnels)':''}</td><td class="v">${fmt(dOut,1)} → ${fmt(dIn,1)} mol/m²</td></tr>
   </table>
   ${ledHTML}
   ${tunHTML}
-  <div class="src">Water absorption: Pope &amp; Fry 1997, Appl. Opt. 36:8710 (400–700 nm, 10 nm steps; e.g. 450 nm 0.0092, 550 nm 0.0565, 650 nm 0.340, 700 nm 0.624 m⁻¹). Spectral Beer–Lambert with refraction into water (n=1.333), integrated with a 5778 K solar spectrum and CIE 1931 CMFs → linear sRGB, luminance and PAR photons. Mars: S₀=590 W/m², direct = S₀·e^(−τ/μ). Diffuse is the remainder of a δ-Eddington two-stream downward flux (Joseph, Wiscombe &amp; Weinman 1976, J. Atmos. Sci. 33:2452; Meador &amp; Weaver 1980, J. Atmos. Sci. 37:630) with solar-band dust ω₀=0.94, g=0.70 (Wolff et al. 2009; Madeleine et al. 2011) and surface albedo 0.20. At τ≤1 this stays within a few percent of the older 0.75·S₀μ(1−e^(−τ/μ)) fit; at τ=10.8 (Opportunity, June 2018) it falls to ~8 % of TOA instead of saturating at 75 %. 100 lm/W, 2.06 µmol/J. Dust colour of sun/sky is qualitative. Pillow geometry, tether count and loads are a conceptual layout, not a structural design.</div>`;
+  <div class="src">Water absorption: Pope &amp; Fry 1997, Appl. Opt. 36:8710 (400–700 nm, 10 nm steps; e.g. 450 nm 0.0092, 550 nm 0.0565, 650 nm 0.340, 700 nm 0.624 m⁻¹). Spectral Beer–Lambert with refraction into water (n=1.333), integrated with a 5778 K solar spectrum and CIE 1931 CMFs → linear sRGB, luminance and PAR photons. Pillows as drawn (${fmt(PW,2)} × ${fmt(PH,2)} × ${fmt(PW,2)} m rounded cushions on the ${G.cell} m grid): ${fmt(PILLOW.V,2)} m³ water each, i.e. ${fmt(PILLOW.depth,3)} m of water per layer averaged over the roof (used for mass, load and shielding), and ${fmt(100*PILLOW.open,1)} % open area per layer (tether streets + rounded corners). Optics: each layer is an area-weighted screen, T = open + Σ area·T<sub>bag</sub>·e<sup>−a·d·pf</sup> over the pillow’s chord lengths d, raised to the number of layers (layers independent: an oblique ray drifts out of the 14 cm streets). Mars: S₀=590 W/m², direct = S₀·e^(−τ/μ). Diffuse is the remainder of a δ-Eddington two-stream downward flux (Joseph, Wiscombe &amp; Weinman 1976, J. Atmos. Sci. 33:2452; Meador &amp; Weaver 1980, J. Atmos. Sci. 37:630) with solar-band dust ω₀=0.94, g=0.70 (Wolff et al. 2009; Madeleine et al. 2011) and surface albedo 0.20. At τ≤1 this stays within a few percent of the older 0.75·S₀μ(1−e^(−τ/μ)) fit; at τ=10.8 (Opportunity, June 2018) it falls to ~8 % of TOA instead of saturating at 75 %. 100 lm/W, 2.06 µmol/J. Dust colour of sun/sky is qualitative. Pillow geometry, tether count and loads are a conceptual layout, not a structural design.</div>`;
 
   const domeLine = `Dome: Ø ${fmt(2*G.R)} m · ${fmt(L*G.layerH,0)} m water sky · ${stats.waterBottom>0.3 ? fmt(stats.waterBottom,0)+' m clear' : '0 m clear'}`;
   const forcesLine = `Forces: ${fmt(dp,1)} kPa air ↑ = ${fmt(waterKPa,1)} kPa water ↓ + ${fmt(net,1)} kPa tethers ↓`;
@@ -1507,12 +1626,11 @@ function updateLight(){
     shieldLine = `Shielding: ${fmt(sh.total,0)} g/cm² ≈ Earth at ${altStr} altitude${place ? ' ('+place.name+')' : ''}`;
   }
   const luxTot = luxIn + ledLux;
-  const SHARE_TOL = 0.02;
   let tint;
-  if (luxTot < 5 || mixSum <= 1e-9) tint = 'night';
-  else if (Math.abs(redMix - LED_TARGET_RED_SHARE) <= SHARE_TOL) tint = 'Earth-white';
-  else if (redMix < LED_TARGET_RED_SHARE) tint = 'blue-green tint';
-  else tint = `red share ${fmt(100*redMix,0)} %`;
+  if (luxTot < 5 || mixSum <= 1e-9 || !colMix) tint = 'night';
+  else if (Math.abs(colMix.Duv) < WHITE_DUV_TOL) tint = `white (${fmt(Math.round(colMix.CCT/100)*100,0)} K)`;
+  else if (colMix.Duv < 0) tint = 'pink tint';
+  else tint = 'blue-green tint';
   let lightSrc = '';
   if (params.ledW > 0 && luxIn > 0.5) lightSrc = ' (Sun + 620/660 nm LEDs)';
   else if (params.ledW > 0) lightSrc = ' (620/660 nm LEDs)';
@@ -1538,7 +1656,8 @@ function updateLight(){
   </div>`;
   window.__summary = { dome:domeLine, forces:forcesLine, shielding:shieldLine, light:lightLine, botany:botanyLine, mix:{r:mixR,g:mixG,b:mixB} };
   applyInfoModeChrome();
-  document.getElementById('infoBody').innerHTML = infoMode==='summary' ? summaryHTML : fullHTML;
+  const html = infoMode==='summary' ? summaryHTML : fullHTML;
+  if (html !== _lastInfoHTML){ _lastInfoHTML = html; document.getElementById('infoBody').innerHTML = html; }
 }
 
 
@@ -1597,7 +1716,7 @@ function rebuildStructure(){
   if (['overview','exterior','section','platform'].includes(params.view)) applyCamera(params.view);
   rebuild();
 }
-window.__mars = { params, renderer, get rebuildHeight(){ return rebuildHeight; }, get rebuildLayers(){ return rebuildLayers; }, rebuild, rebuildStructure, plateauClearHeight, platformDeckY, platformGroup, camera, controls, applyCamera, get ledAutoState(){ return ledAutoState; }, computeLedAuto, updateLight, interiorTransmission, irradiance, sunVector, waterT, get infoMode(){ return infoMode; }, setInfoMode, get summary(){ return window.__summary; }, get anchors(){ return anchors; }, get stats(){ return stats; }, tetherCount, buildAnchors };   // test hook
+window.__mars = { params, renderer, get rebuildHeight(){ return rebuildHeight; }, get rebuildLayers(){ return rebuildLayers; }, rebuild, rebuildStructure, plateauClearHeight, platformDeckY, platformGroup, camera, controls, applyCamera, get ledAutoState(){ return ledAutoState; }, computeLedAuto, updateLight, interiorTransmission, irradiance, sunVector, waterT, get infoMode(){ return infoMode; }, setInfoMode, get summary(){ return window.__summary; }, get anchors(){ return anchors; }, get stats(){ return stats; }, tetherCount, buildAnchors, lights: { sun, hemi, ledLight, TINT, rectFormFactor } };   // test hook
 const rebuildLayers = debounce(() => withLoading('rebuild', [['Hanging water pillows', 0.5, rebuild]]), 250);
 const gui = new GUI({ title: 'MARSOUPILAMI controls' });
 gui.add(params, 'height', H_MIN, H_MAX, 0.5).name('membrane height (m)').onChange(rebuildHeight);
@@ -1607,7 +1726,7 @@ gui.add(params, 'platform').name('Hanging platform (auto >25 m)').onChange(rebui
 const fL = gui.addFolder('Red LEDs (620 + 660 nm)');
 cLedW = fL.add(params, 'ledW', 0, 100, 1).name('Red LEDs (W/m²)').onChange(() => { if (!params.ledAuto) updateLight(); });
 fL.add(params, 'ledMix620', 0, 1, 0.01).name('620/660 mix (fraction 620 nm)').onChange(updateLight);
-fL.add(params, 'ledAuto').name('Auto-balance (Earth-like white)').onChange(() => { if (params.ledAuto) cLedW.disable(); else cLedW.enable(); updateLight(); });
+fL.add(params, 'ledAuto').name('Auto-balance (white, Duv = 0)').onChange(() => { if (params.ledAuto) cLedW.disable(); else cLedW.enable(); updateLight(); });
 fL.add(params, 'ledHours', 0, 24, 0.5).name('LED hours / sol').onChange(updateLight);
 if (params.ledAuto) cLedW.disable();
 const fT = gui.addFolder('Light tunnels (skylights)');
@@ -1632,7 +1751,7 @@ gui.add(params, 'labels').name('labels').onChange(rebuild);
 const fS = gui.addFolder('Sun / Mars time');
 fS.add(params, 'time', 0, 24, 0.05).name('local solar time (h)').onChange(updateLight);
 fS.add(params, 'pathLights', ['auto','on','off']).name('night lights (path + uplights)').onChange(updateLight);
-fS.add(params, 'lat', -60, 60, 1).name('latitude °N').onChange(updateLight);
+fS.add(params, 'lat', -60, 60, 0.01).name('latitude °N').onChange(updateLight);
 fS.add(params, 'decl', -25.2, 25.2, 0.1).name('solar declination °').onChange(updateLight);
 fS.add(params, 'tau', 0.2, 11, 0.05).name('dust optical depth τ').onChange(updateLight);
 fS.add(params, 'exposure', 0.2, 4, 0.05).name('camera exposure').onChange(updateLight);
@@ -1656,6 +1775,9 @@ const pt = {
   // 0.0.23 shader rewinds the bounce index so they do not consume `bounces`).
   transmissiveBounces: (qs.has('ptTransBounces') && Number.isFinite(Number(qs.get('ptTransBounces'))) && Number(qs.get('ptTransBounces')) >= 0)
     ? Math.round(Number(qs.get('ptTransBounces'))) : 16,
+  // auto: follow the layer count (2 interfaces per pillow) until the slider or ?ptTransBounces is used
+  transAuto: !qs.has('ptTransBounces'),
+  lightObjs: [], matPairs: [], lightSig: '',
   pauseUnfocused: true,
   unfocused: false,
   nextSubmitAt: 0,
@@ -1673,10 +1795,10 @@ function ptCamKey(){
   return [p.x,p.y,p.z,t.x,t.y,t.z,camera.fov,camera.aspect].map(v=>v.toFixed(4)).join(',');
 }
 function ptWaterAttColor(){
-  // 1 m of water, same band-integrated T as interiorTransmission / bandT (Pope & Fry).
-  // T_BAG is folded in once per metre (≈ one pillow on a vertical path).
+  // 1 m of pure water, same band-integrated T as the solver's bandT (Pope & Fry). The pillow bag films
+  // are a surface factor (√T_BAG per interface, see ptMaterial), so the pool gets plain water.
   const T = bandT(A_WATER.map(a => Math.exp(-a)));
-  return new THREE.Color(Math.max(T.r*T_BAG, 1e-4), Math.max(T.g*T_BAG, 1e-4), Math.max(T.b*T_BAG, 1e-4));
+  return new THREE.Color(Math.max(T.r, 1e-4), Math.max(T.g, 1e-4), Math.max(T.b, 1e-4));
 }
 function ptMaterial(src){
   if (!src) return new THREE.MeshStandardMaterial({ color:0x888888, roughness:0.8 });
@@ -1697,6 +1819,8 @@ function ptMaterial(src){
   m.side = src.side ?? THREE.FrontSide;
   m.vertexColors = !!src.vertexColors;
   if (src.map) m.map = src.map;
+  if (src.alphaMap) m.alphaMap = src.alphaMap;   // perforated funnels: holes are alpha cut-outs
+  m.alphaTest = src.alphaTest || 0;
   if (wantGlass){
     if (isPillow){
       // 0.0.23 multiplies path throughput by (transmission * color) at every interface.
@@ -1705,7 +1829,8 @@ function ptMaterial(src){
       // black before volume absorption. Color must be white; absorption is only
       // Beer–Lambert: T = exp(ln(attenuationColor) * dist / attenuationDistance),
       // with dist the world-space path length through the closed pillow volume (m).
-      m.color.set(0xffffff);
+      // The two bag films (T_BAG per pillow) are a surface factor: √T_BAG at each of the 2 interfaces.
+      m.color.setScalar(Math.sqrt(T_BAG));
       m.roughness = 0.02;
       m.metalness = 0;
       m.transmission = 1;
@@ -1771,11 +1896,13 @@ function mergeInstancedMesh(im){
   const src = im.geometry;
   const srcPos = src.getAttribute('position');
   const srcNrm = src.getAttribute('normal');
+  const srcUv = src.getAttribute('uv');
   const srcIdx = src.index;
   const n = im.count, vPer = srcPos.count, iPer = srcIdx ? srcIdx.count : vPer;
   if (n <= 0 || vPer <= 0) return null;
   const pos = new Float32Array(n * vPer * 3);
   const nrm = srcNrm ? new Float32Array(n * vPer * 3) : null;
+  const uv = srcUv ? new Float32Array(n * vPer * 2) : null;
   const idx = new Uint32Array(n * iPer);
   const M = new THREE.Matrix4(), N = new THREE.Matrix3(), p = new THREE.Vector3(), q = new THREE.Vector3();
   for (let i=0;i<n;i++){
@@ -1785,7 +1912,8 @@ function mergeInstancedMesh(im){
     for (let v=0;v<vPer;v++){
       p.fromBufferAttribute(srcPos, v).applyMatrix4(M);
       const o = (vo+v)*3; pos[o]=p.x; pos[o+1]=p.y; pos[o+2]=p.z;
-      if (nrm){ q.fromBufferAttribute(srcNrm, v).applyNormalMatrix(N); nrm[o]=q.x; nrm[o+1]=q.y; nrm[o+2]=q.z; }
+      if (nrm){ q.fromBufferAttribute(srcNrm, v).applyNormalMatrix(N); nrm[o]=q.x; nrm[o+1]=q.y; nrm[o+2]=q.z; }   // applyNormalMatrix normalizes (r160)
+      if (uv){ const u = (vo+v)*2; uv[u] = srcUv.getX(v); uv[u+1] = srcUv.getY(v); }
     }
     if (srcIdx){ for (let k=0;k<iPer;k++) idx[io+k] = srcIdx.getX(k) + vo; }
     else { for (let k=0;k<iPer;k++) idx[io+k] = vo + k; }
@@ -1793,6 +1921,7 @@ function mergeInstancedMesh(im){
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   if (nrm) g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  if (uv) g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   g.setIndex(new THREE.BufferAttribute(idx, 1));
   return g;
 }
@@ -1801,6 +1930,7 @@ function filterGeometry(geo, keepTri, matrixWorld){
   const pos = src.getAttribute('position');
   const nrm = src.getAttribute('normal');
   const col = src.getAttribute('color');
+  const uvA = src.getAttribute('uv');
   const keep = [];
   const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
   const mw = matrixWorld || new THREE.Matrix4();
@@ -1816,15 +1946,18 @@ function filterGeometry(geo, keepTri, matrixWorld){
   const p2 = new Float32Array(n*3);
   const n2 = nrm ? new Float32Array(n*3) : null;
   const c2 = col ? new Float32Array(n*col.itemSize) : null;
+  const u2 = uvA ? new Float32Array(n*2) : null;
   for (let i=0;i<n;i++){
     const v = keep[i];
     p2[i*3]=pos.getX(v); p2[i*3+1]=pos.getY(v); p2[i*3+2]=pos.getZ(v);
     if (n2){ n2[i*3]=nrm.getX(v); n2[i*3+1]=nrm.getY(v); n2[i*3+2]=nrm.getZ(v); }
     if (c2){ for (let k=0;k<col.itemSize;k++) c2[i*col.itemSize+k] = col.getComponent(v,k); }
+    if (u2){ u2[i*2]=uvA.getX(v); u2[i*2+1]=uvA.getY(v); }
   }
   out.setAttribute('position', new THREE.BufferAttribute(p2,3));
   if (n2) out.setAttribute('normal', new THREE.BufferAttribute(n2,3));
   if (c2) out.setAttribute('color', new THREE.BufferAttribute(c2, col.itemSize));
+  if (u2) out.setAttribute('uv', new THREE.BufferAttribute(u2, 2));
   if (src !== geo) src.dispose();
   return out;
 }
@@ -1890,6 +2023,7 @@ function bakePathTraceScene(){
     }
     if (needsSlice){
       const sliced = filterGeometry(geo, ptKeepTri, obj.matrixWorld);
+      if (geo !== obj.geometry) geo.dispose();   // temporary wave geometry
       if (!sliced) return;
       addMesh(sliced, ptMatOf(obj.material)); // already in world space
       return;
@@ -1897,11 +2031,35 @@ function bakePathTraceScene(){
     addMesh(geo.clone(), ptMatOf(obj.material), obj.matrixWorld);
   });
   // lights: sun + LED canopy (area) + any visible spots. HemisphereLight is not supported; env map fills the sky.
-  scene.traverse(obj => {
-    if (!obj.isLight || !obj.visible) return;
+  const lightObjs = ptAddLights(out);
+  stats.lights = lightObjs.filter(o => o.isLight).length;
+  if (!pt.env){
+    pt.env = new GradientEquirectTexture(256);
+    pt.env.topColor.setRGB(...PT_SKY.top);
+    pt.env.bottomColor.setRGB(...PT_SKY.bottom);
+    pt.env.exponent = PT_SKY.exponent;
+    pt.env.update();
+  }
+  out.background = pt.env;
+  out.environment = pt.env;
+  out.environmentIntensity = out.backgroundIntensity = ptEnvK;   // read by the tracer (r163 fields)
+  out.backgroundBlurriness = 0.15;
+  return { scene: out, stats, lightObjs, matPairs: [...matCache.entries()] };
+}
+// Active raster lights (visible, non-zero), cloned into the path-trace scene in world space.
+function ptActiveLights(){
+  const list = [];
+  scene.traverseVisible(obj => {
+    if (!obj.isLight) return;
     if (obj.isHemisphereLight || obj.isAmbientLight) return;
-    if ((obj.isSpotLight || obj.isPointLight) && (!obj.intensity || obj.intensity <= 0)) return;
-    if (obj.isRectAreaLight && (!obj.intensity || obj.intensity <= 0)) return;
+    if (!obj.intensity || obj.intensity <= 0) return;
+    list.push(obj);
+  });
+  return list;
+}
+function ptAddLights(out){
+  const added = [];
+  for (const obj of ptActiveLights()){
     const L = obj.clone();
     obj.updateMatrixWorld(true);
     L.matrix.copy(obj.matrixWorld);
@@ -1909,28 +2067,52 @@ function bakePathTraceScene(){
     if (obj.target){
       obj.target.updateMatrixWorld(true);
       L.target.position.setFromMatrixPosition(obj.target.matrixWorld);
-      out.add(L.target);
+      out.add(L.target); added.push(L.target);
     }
-    out.add(L);
-    stats.lights++;
-  });
-  if (!pt.env){
-    pt.env = new GradientEquirectTexture(256);
-    pt.env.topColor.setRGB(0.62, 0.42, 0.28);
-    pt.env.bottomColor.setRGB(0.86, 0.62, 0.40);
-    pt.env.exponent = 0.6;
-    pt.env.update();
+    out.add(L); added.push(L);
   }
-  out.background = pt.env;
-  out.environment = pt.env;
-  out.backgroundBlurriness = 0.15;
-  return { scene: out, stats };
+  return added;
+}
+function ptLightSig(){
+  const f = v => (+v).toPrecision(5);
+  const parts = ptActiveLights().map(o => {
+    o.updateMatrixWorld(true);
+    const p = new THREE.Vector3().setFromMatrixPosition(o.matrixWorld);
+    const t = o.target ? (o.target.updateMatrixWorld(true), new THREE.Vector3().setFromMatrixPosition(o.target.matrixWorld)) : null;
+    return [o.type, o.uuid, f(o.intensity), o.color.getHexString(), f(p.x), f(p.y), f(p.z),
+      t ? [f(t.x), f(t.y), f(t.z)].join(',') : '', o.width ?? '', o.height ?? ''].join(':');
+  });
+  const em = (pt.matPairs || []).map(([s]) => s.emissiveIntensity ?? '').join(',');
+  return parts.join('|') + '#' + f(ptEnvK) + '#' + em;
+}
+// Re-sync lights, sky intensity and emissive lamp materials after updateLight() (time, τ, LEDs, lamps).
+function ptSyncLighting(){
+  if (!pt.enabled || pt.building || !pt.scene || !pt.pathTracer) return;
+  const sig = ptLightSig();
+  if (sig === pt.lightSig) return;
+  pt.lightSig = sig;
+  for (const o of pt.lightObjs) if (o.parent) o.parent.remove(o);
+  pt.lightObjs = ptAddLights(pt.scene);
+  pt.stats.lights = pt.lightObjs.filter(o => o.isLight).length;
+  pt.scene.environmentIntensity = pt.scene.backgroundIntensity = ptEnvK;
+  let matChanged = false;
+  for (const [src, dst] of pt.matPairs){
+    if (dst.transmission > 0 || src.emissiveIntensity == null || !dst.emissive) continue;
+    if (dst.emissiveIntensity !== src.emissiveIntensity){ dst.emissiveIntensity = src.emissiveIntensity; matChanged = true; }
+  }
+  pt.pathTracer.updateLights();
+  pt.pathTracer.updateEnvironment();
+  if (matChanged) pt.pathTracer.updateMaterials();
+  pt.pathTracer.reset();
 }
 function disposePtScene(s){
   if (!s) return;
+  const mats = new Set();
   s.traverse(o => {
     if (o.geometry && o.geometry.dispose) o.geometry.dispose();
+    if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => mats.add(m));
   });
+  mats.forEach(m => m.dispose());   // per-bake MeshStandard/Physical copies (textures are shared, not disposed)
 }
 function setPtStats(text){
   if (!ptStatsEl) return;
@@ -1954,6 +2136,8 @@ function startPathTrace(){
   const bakeMs = performance.now() - t0;
   disposePtScene(pt.scene);
   pt.scene = baked.scene;
+  pt.lightObjs = baked.lightObjs;
+  pt.matPairs = baked.matPairs;
   Object.assign(pt.stats, baked.stats, { bakeMs: +bakeMs.toFixed(1) });
   if (!pt.pathTracer){
     const ptr = new WebGLPathTracer(renderer);
@@ -1981,6 +2165,7 @@ function startPathTrace(){
   pt.stats.bakeMs = +bakeMs.toFixed(1);
   pt.enabled = true;
   pt.building = false;
+  pt.lightSig = ptLightSig();
   pt.lastCam = ptCamKey();
   pt.nextSubmitAt = 0;
   applyPtTiles(false);
@@ -2003,6 +2188,7 @@ function ptOnRebuild(){
   if (pt.enabled || pt.building) startPathTrace();
 }
 window.__pt = pt;
+ptHook = ptSyncLighting;
 pt.start = startPathTrace;
 pt.stop = stopPathTrace;
 
@@ -2016,6 +2202,7 @@ pt.stop = stopPathTrace;
 // use a conservative heuristic: assume GPU time is at least max(cpuMs, 8 ms) × 2
 // and skip frames the same way.
 const PT_FRAME_MS = 1000 / 60;
+let cPtTrans = null;
 function applyPtTiles(reset=true){
   const n = Math.max(1, Math.min(16, Math.round(pt.tiles)));
   pt.tiles = n;
@@ -2035,6 +2222,11 @@ function applyPtBounces(reset=true){
 // regular `bounces` budget. It is not a total path-length cap and not a subset
 // of `bounces`. Two interfaces per water pillow, so 8 layers need ~16+.
 function applyPtTransBounces(reset=true){
+  if (pt.transAuto){
+    const L = params.pillows ? params.layers : 0;
+    pt.transmissiveBounces = Math.max(16, 2*L);
+    cPtTrans?.updateDisplay();
+  }
   if (!pt.pathTracer) return;
   pt.pathTracer.transmissiveBounces = pt.useTransmission ? pt.transmissiveBounces : 0;
   if (reset) pt.pathTracer.reset();
@@ -2155,7 +2347,7 @@ fPT.add(ptCtl, 'enabled').name('Path trace').onChange(v => {
 fPT.add(pt, 'tiles', 1, 16, 1).name('tiles').onChange(() => applyPtTiles(true));
 fPT.add(pt, 'budgetMs', 4, 48, 1).name('GPU budget (ms)');
 fPT.add(pt, 'bounces', 1, 64, 1).name('bounces').onChange(() => applyPtBounces(true));
-fPT.add(pt, 'transmissiveBounces', 0, 64, 1).name('transmissive bounces').onChange(() => applyPtTransBounces(true));
+cPtTrans = fPT.add(pt, 'transmissiveBounces', 0, 64, 1).name('transmissive bounces').onChange(() => { pt.transAuto = false; applyPtTransBounces(true); });
 fPT.add(pt, 'pauseUnfocused').name('pause when unfocused');
 
 window.addEventListener('blur', () => { pt.unfocused = true; });
@@ -2168,7 +2360,63 @@ document.getElementById('infoToggle').addEventListener('click', e => {
   setInfoMode(b.dataset.mode);
 });
 applyInfoModeChrome();
-addEventListener('keydown', e => { if (e.key==='i') document.getElementById('hide').onclick(); });
+addEventListener('keydown', e => { if (e.key==='i' && !e.ctrlKey && !e.metaKey && !e.altKey && !flyTyping()) document.getElementById('hide').onclick(); });
+
+// WASD noclip (Quake-style): fly along the camera view, no clip, no gravity.
+// Camera and orbit target move by the same delta so OrbitControls keeps working.
+const FLY_SPEED = 5, FLY_SPRINT = 4;
+const flyKeys = Object.create(null);
+const flyForward = new THREE.Vector3(), flyRight = new THREE.Vector3(), flyDelta = new THREE.Vector3();
+let flyLastT = 0;
+const FLY_BIND = {
+  KeyW:'w', KeyS:'s', KeyA:'a', KeyD:'d',
+  KeyQ:'q', KeyE:'e',
+  Space:'up', ControlLeft:'down', ControlRight:'down',
+  ShiftLeft:'shift', ShiftRight:'shift',
+};
+function flyTyping(){
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+function onFlyKey(e, down){
+  const name = FLY_BIND[e.code];
+  if (!name) return;
+  if (!down){ flyKeys[name] = false; return; }   // always release, so nothing sticks
+  if (flyTyping()) return;
+  // leave browser shortcuts alone (Ctrl/Cmd+A, Ctrl+S, Alt+…); Ctrl itself is still "down"
+  if ((e.metaKey || e.altKey || e.ctrlKey) && name !== 'down') return;
+  if (name === 'up' || name === 'w' || name === 's' || name === 'a' || name === 'd' || name === 'q' || name === 'e') e.preventDefault();
+  flyKeys[name] = down;
+}
+addEventListener('keydown', e => onFlyKey(e, true));
+addEventListener('keyup', e => onFlyKey(e, false));
+function flyClearKeys(){ for (const k of Object.keys(flyKeys)) flyKeys[k] = false; }
+window.addEventListener('blur', flyClearKeys);
+renderer.domElement.addEventListener('pointerdown', () => { if (flyTyping()) document.activeElement.blur(); });
+if (window.__mars){ window.__mars.flyKeys = flyKeys; window.__mars.tickFly = tickFly; }
+function tickFly(now){
+  const dt = flyLastT ? Math.min(0.05, (now - flyLastT) / 1000) : 0;
+  flyLastT = now;
+  const k = flyKeys;
+  const x = (k.d?1:0) - (k.a?1:0);
+  const y = (k.e?1:0) + (k.up?1:0) - (k.q?1:0) - (k.down?1:0);
+  const z = (k.w?1:0) - (k.s?1:0);
+  if (!x && !y && !z) return;
+  camera.getWorldDirection(flyForward);
+  flyRight.crossVectors(flyForward, camera.up);
+  if (flyRight.lengthSq() < 1e-8) flyRight.setFromMatrixColumn(camera.matrixWorld, 0);
+  flyRight.normalize();
+  flyDelta.set(0,0,0);
+  if (z) flyDelta.addScaledVector(flyForward, z);
+  if (x) flyDelta.addScaledVector(flyRight, x);
+  if (y) flyDelta.y += y;
+  if (flyDelta.lengthSq() < 1e-12) return;
+  flyDelta.normalize().multiplyScalar(FLY_SPEED * (k.shift ? FLY_SPRINT : 1) * dt);
+  camera.position.add(flyDelta);
+  controls.target.add(flyDelta);
+}
 addEventListener('resize', () => { camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight); labelRenderer.setSize(innerWidth, innerHeight);
   if (pt.enabled && pt.pathTracer) pt.pathTracer.updateCamera(); });
@@ -2189,6 +2437,7 @@ withLoading('', [...structureSteps(), ['Placing camera', 0.95, () => {
     let frames = 0;
     const autoPT = qs.get('pathTrace')==='1' || qs.get('pathTrace')==='true';
     renderer.setAnimationLoop(() => {
+      tickFly(performance.now());
       controls.update();
       if (pt.enabled) tickPathTrace();
       else renderer.render(scene, camera);
